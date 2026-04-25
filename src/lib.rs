@@ -721,20 +721,39 @@ fn pipe_server_loop(
         }
 
         // ─── コマンドを処理してレスポンスを送信 ───
-        if let Some(data) = received {
-            let response = match String::from_utf8(data) {
-                Ok(command) => {
-                    tracing::info!("コマンドを受信しました: {}", command.trim());
-                    process_command(command.trim(), recorder)
-                }
-                Err(e) => {
-                    tracing::error!("UTF-8 デコードに失敗しました: {}", e);
-                    format!("err:UTF-8デコードエラー: {}", e)
-                }
-            };
+        match received {
+            Ok(data) => {
+                let response = match String::from_utf8(data) {
+                    Ok(command) => {
+                        tracing::info!("コマンドを受信しました: {}", command.trim());
+                        process_command(command.trim(), recorder)
+                    }
+                    Err(e) => {
+                        tracing::error!("UTF-8 デコードに失敗しました: {}", e);
+                        format!("err:UTF-8デコードエラー: {}", e)
+                    }
+                };
 
-            tracing::info!("レスポンスを送信します: {}", response);
-            let _ = write_pipe_message(pipe, response.as_bytes());
+                tracing::info!("レスポンスを送信します: {}", response);
+                let _ = write_pipe_message(pipe, response.as_bytes());
+            }
+            Err(ReadPipeError::Oversized) => {
+                tracing::warn!(
+                    "受信メッセージが上限 ({} バイト) を超えています。err: を返します",
+                    MAX_PAYLOAD_BYTES
+                );
+                let _ = write_pipe_message(
+                    pipe,
+                    format!(
+                        "err:メッセージサイズが上限 ({} バイト) を超えています",
+                        MAX_PAYLOAD_BYTES
+                    )
+                    .as_bytes(),
+                );
+            }
+            Err(ReadPipeError::Io) => {
+                // 接続切断または I/O エラー: レスポンスなしで切断する
+            }
         }
 
         // ─── パイプを切断してクローズ ───
@@ -852,7 +871,21 @@ fn wait_for_client(pipe: HANDLE) -> bool {
     }
 }
 
+/// `read_pipe_message` が返すエラー種別。
+#[derive(Debug)]
+enum ReadPipeError {
+    /// 受信メッセージのサイズがプロトコル上限 (`MAX_PAYLOAD_BYTES`) を超えた。
+    /// 呼び出し元は `err:` レスポンスを送信して接続を切断すること。
+    Oversized,
+    /// I/O エラーまたは接続切断。
+    /// 呼び出し元はレスポンスを送らずに接続を切断すること。
+    Io,
+}
+
 /// パイプから 1 メッセージ分のデータをすべて読み取る。
+///
+/// メッセージの累積サイズが `MAX_PAYLOAD_BYTES` を超えた時点で読み取りを打ち切り、
+/// `Err(ReadPipeError::Oversized)` を返す。これにより無制限のメモリ確保を防ぐ。
 ///
 /// # 引数
 ///
@@ -860,8 +893,10 @@ fn wait_for_client(pipe: HANDLE) -> bool {
 ///
 /// # 戻り値
 ///
-/// 受信データのバイト列。読み取り中断時は `None`。
-fn read_pipe_message(pipe: HANDLE) -> Option<Vec<u8>> {
+/// - `Ok(data)` — 受信データのバイト列
+/// - `Err(ReadPipeError::Oversized)` — メッセージが上限を超えた
+/// - `Err(ReadPipeError::Io)` — I/O エラーまたは接続切断
+fn read_pipe_message(pipe: HANDLE) -> Result<Vec<u8>, ReadPipeError> {
     use windows::Win32::Foundation::ERROR_MORE_DATA;
     let mut message: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; MAX_PAYLOAD_BYTES];
@@ -871,28 +906,38 @@ fn read_pipe_message(pipe: HANDLE) -> Option<Vec<u8>> {
         match unsafe { ReadFile(pipe, Some(&mut chunk), Some(&mut bytes_read), None) } {
             Ok(()) => {
                 let bytes_read = bytes_read as usize;
-                let new_len = message.len().checked_add(bytes_read)?;
+                let new_len = message
+                    .len()
+                    .checked_add(bytes_read)
+                    .ok_or(ReadPipeError::Oversized)?;
                 if new_len > MAX_PAYLOAD_BYTES {
-                    return None;
+                    return Err(ReadPipeError::Oversized);
                 }
                 message.extend_from_slice(&chunk[..bytes_read]);
                 break;
             }
             Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
                 let bytes_read = bytes_read as usize;
-                let new_len = message.len().checked_add(bytes_read)?;
+                let new_len = message
+                    .len()
+                    .checked_add(bytes_read)
+                    .ok_or(ReadPipeError::Oversized)?;
                 if new_len > MAX_PAYLOAD_BYTES {
-                    return None;
+                    return Err(ReadPipeError::Oversized);
                 }
                 message.extend_from_slice(&chunk[..bytes_read]);
             }
             Err(_) => {
-                return None;
+                return Err(ReadPipeError::Io);
             }
         }
     }
 
-    if message.is_empty() { None } else { Some(message) }
+    if message.is_empty() {
+        Err(ReadPipeError::Io)
+    } else {
+        Ok(message)
+    }
 }
 
 /// パイプにバイト列を書き込む。
