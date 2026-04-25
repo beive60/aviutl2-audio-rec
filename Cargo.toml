@@ -1,0 +1,32 @@
+[package]
+name = "aviutl2_audio_rec"
+version = "0.1.0"
+edition = "2024"
+
+# プラグイン DLL（.aux2）ターゲット
+[lib]
+name = "aviutl2_audio_rec"
+crate-type = ["cdylib"]
+
+# CLI クライアント実行ファイルターゲット
+[[bin]]
+name = "audio_rec_cli"
+path = "src/main.rs"
+
+[dependencies]
+# AviUtl2 SDK の Rust バインディング（汎用プラグイン API を使用）
+aviutl2 = "0.23"
+# クロスプラットフォーム オーディオキャプチャ（WASAPI バックエンド）
+cpal = "0.15"
+# WAV ファイルエンコード
+hound = "3"
+# Windows API バインディング（Named Pipe / ファイル I/O）
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+] }
+# トレーシングマクロ（tracing::info! 等）
+tracing = "0.1"
