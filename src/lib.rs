@@ -262,13 +262,23 @@ impl AudioRecorder for CpalHoundRecorder {
                 drop(_stream);
 
                 // WAV ライターを取り出してファイナライズ（ヘッダを確定して閉じる）
-                if let Some(w) = writer.lock().unwrap().take() {
+                // Mutex が poison されていても into_inner() でパニックを回避する
+                let writer_opt = match writer.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(e) => e.into_inner().take(),
+                };
+                if let Some(w) = writer_opt {
                     w.finalize()
                         .map_err(|e| format!("WAVファイルのファイナライズに失敗しました: {}", e))?;
                 }
 
                 // コールバック内でエラーが発生していた場合はそれを返す
-                if let Some(err) = callback_error.lock().unwrap().take() {
+                // Mutex が poison されていても into_inner() でパニックを回避する
+                let cb_err = match callback_error.lock() {
+                    Ok(mut g) => g.take(),
+                    Err(e) => e.into_inner().take(),
+                };
+                if let Some(err) = cb_err {
                     return Err(format!("録音中にコールバックエラーが発生しました: {}", err));
                 }
 
@@ -473,18 +483,31 @@ impl GenericPlugin for AudioRecPlugin {
 
         let flag = Arc::clone(&self.shutdown_flag);
         let active_pipe = Arc::clone(&self.active_pipe);
-        let thread = std::thread::Builder::new()
+        let thread = match std::thread::Builder::new()
             .name("audio_rec_pipe_server".to_string())
             .spawn(move || {
                 tracing::info!("Named Pipe サーバースレッドを開始しました");
                 let mut recorder = CpalHoundRecorder::new();
                 pipe_server_loop(flag, active_pipe, &mut recorder);
                 tracing::info!("Named Pipe サーバースレッドを終了しました");
-            })
-            .expect("ワーカースレッドの起動に失敗しました");
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("ワーカースレッドの起動に失敗しました（録音機能は無効）: {}", e);
+                return;
+            }
+        };
 
-        *self.worker_thread.lock().unwrap() = Some(thread);
-        tracing::info!("Named Pipe サーバーを起動しました: {}", PIPE_NAME);
+        match self.worker_thread.lock() {
+            Ok(mut guard) => {
+                *guard = Some(thread);
+                tracing::info!("Named Pipe サーバーを起動しました: {}", PIPE_NAME);
+            }
+            Err(e) => {
+                tracing::error!("worker_thread Mutex が汚染されています。スレッドを記録できません: {}", e);
+                // スレッドは起動済みだが参照を保持できないため、デタッチされる
+            }
+        }
     }
 }
 
@@ -501,7 +524,15 @@ impl Drop for AudioRecPlugin {
         self.shutdown_flag.store(true, Ordering::Relaxed);
 
         // ReadFile でブロック中のワーカーを解除（active_pipe が Some ならブロック中）
-        if let Some(h) = self.active_pipe.lock().unwrap().take() {
+        // Mutex が poison されていても into_inner() で中身を取り出してパニックを回避する
+        let maybe_handle = match self.active_pipe.lock() {
+            Ok(mut g) => g.take(),
+            Err(e) => {
+                tracing::error!("active_pipe Mutex が汚染されています: {}", e);
+                e.into_inner().take()
+            }
+        };
+        if let Some(h) = maybe_handle {
             let _ = unsafe { DisconnectNamedPipe(h.0) };
         }
 
@@ -509,9 +540,17 @@ impl Drop for AudioRecPlugin {
         connect_shutdown_client();
 
         // ワーカースレッドの終了を待機
-        if let Some(thread) = self.worker_thread.lock().unwrap().take()
+        // Mutex が poison されていても into_inner() で中身を取り出してパニックを回避する
+        let thread_opt = match self.worker_thread.lock() {
+            Ok(mut g) => g.take(),
+            Err(e) => {
+                tracing::error!("worker_thread Mutex が汚染されています: {}", e);
+                e.into_inner().take()
+            }
+        };
+        if let Some(thread) = thread_opt
             && thread.join().is_err() {
-                tracing::error!("ワーカースレッドがパニックしました。強制終了します");
+                tracing::error!("ワーカースレッドがパニックしました");
             }
 
         tracing::info!("プラグインのシャットダウンが完了しました");
