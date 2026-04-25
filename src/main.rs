@@ -427,27 +427,4 @@ mod tests {
         let msg = result.unwrap_err();
         assert!(msg.contains(".wav"), "エラーメッセージ: {}", msg);
     }
-
-    // ─── handle_response のテスト（process::exit なしで確認できる部分） ───
-    // process::exit を呼ぶパスはここでは直接テストしない（統合テストが必要）
-
-    /// `ok` レスポンスは正常ケースであることを間接的に確認する（パニックしないこと）。
-    #[test]
-    fn test_response_prefix_ok() {
-        assert_eq!("ok", "ok");
-    }
-
-    /// `noop:` プレフィックスが正しく認識されることを確認する。
-    #[test]
-    fn test_response_prefix_noop() {
-        let response = "noop:既に録音中です";
-        assert!(response.strip_prefix("noop:").is_some());
-    }
-
-    /// `err:` プレフィックスが正しく認識されることを確認する。
-    #[test]
-    fn test_response_prefix_err() {
-        let response = "err:デバイスエラー";
-        assert!(response.strip_prefix("err:").is_some());
-    }
 }
