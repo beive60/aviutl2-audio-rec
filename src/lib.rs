@@ -786,11 +786,21 @@ fn read_pipe_message(pipe: HANDLE) -> Option<Vec<u8>> {
         let mut bytes_read: u32 = 0;
         match unsafe { ReadFile(pipe, Some(&mut chunk), Some(&mut bytes_read), None) } {
             Ok(()) => {
-                message.extend_from_slice(&chunk[..bytes_read as usize]);
+                let bytes_read = bytes_read as usize;
+                let new_len = message.len().checked_add(bytes_read)?;
+                if new_len > MAX_PAYLOAD_BYTES {
+                    return None;
+                }
+                message.extend_from_slice(&chunk[..bytes_read]);
                 break;
             }
             Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
-                message.extend_from_slice(&chunk[..bytes_read as usize]);
+                let bytes_read = bytes_read as usize;
+                let new_len = message.len().checked_add(bytes_read)?;
+                if new_len > MAX_PAYLOAD_BYTES {
+                    return None;
+                }
+                message.extend_from_slice(&chunk[..bytes_read]);
             }
             Err(_) => {
                 return None;
