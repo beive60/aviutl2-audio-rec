@@ -49,11 +49,11 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile,
-    WriteFile,
+    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
+    PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
-    PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
     PIPE_WAIT, ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
 };
 use windows::core::PCWSTR;
@@ -203,19 +203,21 @@ impl AudioRecorder for CpalHoundRecorder {
 
         let channels = supported_config.channels();
         let sample_rate = supported_config.sample_rate().0;
+        let cpal_format = supported_config.sample_format();
 
-        // ─── hound WAV スペックを決定 ───
-        let (bits_per_sample, sample_format) = match supported_config.sample_format() {
-            cpal::SampleFormat::I8 | cpal::SampleFormat::I16 | cpal::SampleFormat::I32 => {
-                (16u16, hound::SampleFormat::Int)
-            }
+        // ─── hound WAV スペックをデバイスの実フォーマットに合わせて決定 ───
+        // I8 は i16 に変換して書き込むため 16-bit Int として扱う。
+        // その他の整数型・浮動小数点型はビット深度をそのまま使用する。
+        let (bits_per_sample, hound_sample_format) = match cpal_format {
+            cpal::SampleFormat::I8 | cpal::SampleFormat::I16 => (16u16, hound::SampleFormat::Int),
+            cpal::SampleFormat::I32 => (32u16, hound::SampleFormat::Int),
             _ => (32u16, hound::SampleFormat::Float),
         };
         let spec = hound::WavSpec {
             channels,
             sample_rate,
             bits_per_sample,
-            sample_format,
+            sample_format: hound_sample_format,
         };
 
         // ─── WAV ライターを作成 ───
@@ -225,11 +227,11 @@ impl AudioRecorder for CpalHoundRecorder {
             Arc::new(Mutex::new(Some(wav_writer)));
         let callback_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-        // ─── cpal ストリームを構築 ───
+        // ─── cpal ストリームを構築（デバイスの実フォーマットに合わせた型で構築） ───
         let stream = build_input_stream(
             &device,
             &supported_config.into(),
-            bits_per_sample,
+            cpal_format,
             Arc::clone(&writer),
             Arc::clone(&callback_error),
         )?;
@@ -293,6 +295,15 @@ impl AudioRecorder for CpalHoundRecorder {
 
 /// サンプルフォーマットに応じた cpal 入力ストリームを構築する。
 ///
+/// デバイスの実フォーマットに合わせた型付きコールバックを使用することで、
+/// フォーマット不一致による録音失敗や意図しないデータ解釈を防ぐ。
+///
+/// - `I8`  → `&[i8]` コールバック。各サンプルを i16 に変換（左シフト 8 bit）して書き込む。
+/// - `I16` → `&[i16]` コールバック。そのまま書き込む。
+/// - `I32` → `&[i32]` コールバック。そのまま書き込む。
+/// - `F32` → `&[f32]` コールバック。そのまま書き込む。
+/// - その他 → エラーを返す（WASAPI では通常発生しない）。
+///
 /// コールバック内でのパニックを完全に排除し、I/Oエラーは
 /// `callback_error` を通じてメインスレッドに伝播する。
 ///
@@ -300,13 +311,13 @@ impl AudioRecorder for CpalHoundRecorder {
 ///
 /// * `device` - cpal 入力デバイス
 /// * `config` - ストリーム設定
-/// * `bits_per_sample` - WAV のビット深度（16 または 32）
+/// * `sample_format` - デバイスの実サンプルフォーマット
 /// * `writer` - 共有 WAV ライター
 /// * `callback_error` - コールバックエラー通知用共有状態
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    bits_per_sample: u16,
+    sample_format: cpal::SampleFormat,
     writer: Arc<Mutex<Option<hound::WavWriter<BufWriter<std::fs::File>>>>>,
     callback_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String> {
@@ -314,34 +325,74 @@ fn build_input_stream(
         tracing::error!("cpal ストリームエラー: {}", e);
     };
 
-    let stream = if bits_per_sample == 16 {
-        // i16 サンプルとして録音
-        let writer_clone = Arc::clone(&writer);
-        let error_clone = Arc::clone(&callback_error);
-        device
-            .build_input_stream(
-                config,
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    write_samples_i16(data, &writer_clone, &error_clone);
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("ストリームの構築に失敗しました (i16): {}", e))?
-    } else {
-        // f32 サンプルとして録音
-        let writer_clone = Arc::clone(&writer);
-        let error_clone = Arc::clone(&callback_error);
-        device
-            .build_input_stream(
-                config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    write_samples_f32(data, &writer_clone, &error_clone);
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("ストリームの構築に失敗しました (f32): {}", e))?
+    let stream = match sample_format {
+        cpal::SampleFormat::I8 => {
+            // i8 サンプルを i16 に変換（左シフト 8 bit でビット深度を揃える）して録音
+            let writer_clone = Arc::clone(&writer);
+            let error_clone = Arc::clone(&callback_error);
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[i8], _: &cpal::InputCallbackInfo| {
+                        let converted: Vec<i16> = data.iter().map(|&s| (s as i16) << 8).collect();
+                        write_samples_i16(&converted, &writer_clone, &error_clone);
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("ストリームの構築に失敗しました (i8): {}", e))?
+        }
+        cpal::SampleFormat::I16 => {
+            // i16 サンプルとして録音
+            let writer_clone = Arc::clone(&writer);
+            let error_clone = Arc::clone(&callback_error);
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        write_samples_i16(data, &writer_clone, &error_clone);
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("ストリームの構築に失敗しました (i16): {}", e))?
+        }
+        cpal::SampleFormat::I32 => {
+            // i32 サンプルとして録音
+            let writer_clone = Arc::clone(&writer);
+            let error_clone = Arc::clone(&callback_error);
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                        write_samples_i32(data, &writer_clone, &error_clone);
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("ストリームの構築に失敗しました (i32): {}", e))?
+        }
+        cpal::SampleFormat::F32 => {
+            // f32 サンプルとして録音
+            let writer_clone = Arc::clone(&writer);
+            let error_clone = Arc::clone(&callback_error);
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        write_samples_f32(data, &writer_clone, &error_clone);
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("ストリームの構築に失敗しました (f32): {}", e))?
+        }
+        other => {
+            return Err(format!(
+                "サポートされていないサンプルフォーマットです: {:?}",
+                other
+            ));
+        }
     };
 
     Ok(stream)
@@ -372,6 +423,39 @@ fn write_samples_i16(
             if let Ok(mut err_guard) = callback_error.try_lock()
                 && err_guard.is_none() {
                     *err_guard = Some(format!("サンプル書き込みエラー (i16): {}", e));
+                }
+            // ライターをドロップしてファイルを閉じる（以降の書き込みを停止）
+            drop(guard.take());
+            return;
+        }
+    }
+}
+
+/// i32 サンプルを WAV ライターに書き込む（cpal コールバックから呼ばれる）。
+///
+/// エラーが発生した場合は `callback_error` に格納してライターをクローズする。
+/// `panic!` や `unwrap()` は一切使用しない。
+fn write_samples_i32(
+    data: &[i32],
+    writer: &Arc<Mutex<Option<hound::WavWriter<BufWriter<std::fs::File>>>>>,
+    callback_error: &Arc<Mutex<Option<String>>>,
+) {
+    // ライターロックの取得に失敗した場合はサイレントスキップ
+    let Ok(mut guard) = writer.try_lock() else {
+        return;
+    };
+
+    let Some(ref mut w) = *guard else {
+        // ライターが既にクローズされている（エラー後またはストップ後）
+        return;
+    };
+
+    for &sample in data {
+        if let Err(e) = w.write_sample(sample) {
+            // エラーをメインスレッドへ通知
+            if let Ok(mut err_guard) = callback_error.try_lock()
+                && err_guard.is_none() {
+                    *err_guard = Some(format!("サンプル書き込みエラー (i32): {}", e));
                 }
             // ライターをドロップしてファイルを閉じる（以降の書き込みを停止）
             drop(guard.take());
