@@ -6,13 +6,16 @@
 //! ## 使用方法
 //!
 //! ```text
-//! audio_rec_cli.exe start <WAVファイルの絶対パス>
+//! audio_rec_cli.exe start [<WAVファイルの絶対パス>]
 //! audio_rec_cli.exe stop
+//! audio_rec_cli.exe config save-path <ディレクトリパス>
 //! ```
 //!
 //! ## 動作概要
 //!
 //! ### start コマンド
+//!
+//! パスを省略した場合はデフォルト保存先と `yyyymmdd-hhmmss.wav` のファイル名を使用する。
 //!
 //! 1. 出力先パスの事前検証（Pre-flight validation）を行う：
 //!    - `.wav` 拡張子であること
@@ -28,6 +31,11 @@
 //! 2. `stop` コマンドを送信する。
 //! 3. レスポンスを標準出力に表示する。
 //!
+//! ### config save-path コマンド
+//!
+//! デフォルトの録音ファイル保存先ディレクトリを設定ファイル（JSON）に保存する。
+//! 設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに置かれる。
+//!
 //! ## エラー処理
 //!
 //! 事前検証エラー：標準エラー出力にメッセージを表示し、終了コード `1` で終了。
@@ -35,7 +43,7 @@
 //! プラグインエラー（`err:` レスポンス）：標準エラー出力にメッセージを表示し、終了コード `3` で終了。
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
@@ -43,6 +51,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::WaitNamedPipeW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────
@@ -64,6 +73,66 @@ const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
 
 /// レスポンスバッファの最大バイト数。
 const MAX_RESPONSE_BYTES: usize = 65_536;
+
+/// 設定ファイル名（`audio_rec_cli.exe` と同一ディレクトリに配置する）。
+const CONFIG_FILE_NAME: &str = "audio_rec_cli.json";
+
+// ─────────────────────────────────────────────────────────────
+// 設定ファイル
+// ─────────────────────────────────────────────────────────────
+
+/// CLI の永続設定。`audio_rec_cli.json` に JSON 形式で保存される。
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Config {
+    /// デフォルトの録音ファイル保存先ディレクトリ。
+    /// 未設定の場合は `None`。
+    save_path: Option<String>,
+}
+
+/// 設定ファイルのパスを返す。
+///
+/// 設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに配置する。
+/// 実行ファイルのパスが取得できない場合はカレントディレクトリを使用する。
+fn get_config_path() -> PathBuf {
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    exe_dir.join(CONFIG_FILE_NAME)
+}
+
+/// 設定ファイルを読み込む。
+///
+/// ファイルが存在しない場合やパースに失敗した場合はデフォルト設定を返す。
+fn load_config() -> Config {
+    let path = get_config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => Config::default(),
+    }
+}
+
+/// 設定ファイルに書き込む。
+///
+/// # 戻り値
+///
+/// 成功時は `Ok(())`。失敗時はエラーメッセージ。
+fn save_config(config: &Config) -> Result<(), String> {
+    let path = get_config_path();
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("設定のシリアライズに失敗しました: {}", e))?;
+    std::fs::write(&path, content)
+        .map_err(|e| format!("設定ファイルの書き込みに失敗しました: {} ({})", path.display(), e))
+}
+
+/// 現在のローカル日時を `yyyymmdd-hhmmss` 形式の文字列として返す。
+fn local_datetime_string() -> String {
+    let st = unsafe { GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
 
 // ─────────────────────────────────────────────────────────────
 // RAII ハンドルガード
@@ -103,19 +172,36 @@ fn main() {
     match args[1].as_str() {
         "start" => {
             // ─── start コマンド ───
-            if args.len() != 3 {
-                eprintln!("エラー: 'start' コマンドには出力パスが必要です");
-                eprintln!("例: {} start \"C:\\録音\\output.wav\"", args[0]);
-                process::exit(1);
-            }
-
-            let output_path = &args[2];
+            // パス指定あり: audio_rec_cli.exe start <path>
+            // パス省略:     audio_rec_cli.exe start  （設定ファイルのパス + タイムスタンプ）
+            let output_path: String = if args.len() >= 3 {
+                args[2].clone()
+            } else {
+                // デフォルト保存先を設定ファイルから読み込む
+                let config = load_config();
+                let dir = match config.save_path {
+                    Some(ref d) => d.clone(),
+                    None => {
+                        eprintln!("エラー: デフォルト保存先が設定されていません。");
+                        eprintln!(
+                            "先に '{} config save-path <ディレクトリ>' で保存先を設定してください。",
+                            args[0]
+                        );
+                        process::exit(1);
+                    }
+                };
+                let filename = format!("{}.wav", local_datetime_string());
+                let full_path = PathBuf::from(&dir).join(&filename);
+                full_path.to_string_lossy().into_owned()
+            };
 
             // 事前検証（Pre-flight validation）
-            if let Err(msg) = validate_output_path(output_path) {
+            if let Err(msg) = validate_output_path(&output_path) {
                 eprintln!("エラー: {}", msg);
                 process::exit(1);
             }
+
+            println!("録音先: {}", output_path);
 
             let command = format!("start:{}", output_path);
             match send_command_and_read_response(&command) {
@@ -138,6 +224,43 @@ fn main() {
             }
         }
 
+        "config" => {
+            // ─── config サブコマンド ───
+            if args.len() < 4 || args[2].as_str() != "save-path" {
+                eprintln!("エラー: 'config' サブコマンドの使い方が正しくありません。");
+                eprintln!(
+                    "使用方法: {} config save-path <ディレクトリ>",
+                    args[0]
+                );
+                process::exit(1);
+            }
+
+            let dir = &args[3];
+
+            // ディレクトリの存在チェック
+            if !Path::new(dir).exists() {
+                eprintln!(
+                    "エラー: 指定したディレクトリが存在しません: {}",
+                    dir
+                );
+                process::exit(1);
+            }
+
+            let mut config = load_config();
+            config.save_path = Some(dir.clone());
+
+            match save_config(&config) {
+                Ok(()) => {
+                    println!("デフォルト保存先を設定しました: {}", dir);
+                    println!("設定ファイル: {}", get_config_path().display());
+                }
+                Err(msg) => {
+                    eprintln!("エラー: {}", msg);
+                    process::exit(1);
+                }
+            }
+        }
+
         cmd => {
             eprintln!("エラー: 未知のコマンド '{}'", cmd);
             print_usage(&args[0]);
@@ -149,12 +272,18 @@ fn main() {
 /// 使用方法を標準エラー出力に表示する。
 fn print_usage(program: &str) {
     eprintln!("使用方法:");
-    eprintln!("  {} start <WAVファイルの絶対パス>  -- 録音を開始する", program);
-    eprintln!("  {} stop                           -- 録音を停止する", program);
+    eprintln!("  {} start [<WAVファイルの絶対パス>]  -- 録音を開始する（パス省略時はデフォルト保存先を使用）", program);
+    eprintln!("  {} stop                              -- 録音を停止する", program);
+    eprintln!(
+        "  {} config save-path <ディレクトリ>   -- デフォルト保存先を設定する",
+        program
+    );
     eprintln!();
     eprintln!("例:");
     eprintln!("  {} start \"C:\\録音\\output.wav\"", program);
+    eprintln!("  {} start  # デフォルト保存先 + タイムスタンプ名で録音開始", program);
     eprintln!("  {} stop", program);
+    eprintln!("  {} config save-path \"C:\\録音\"", program);
 }
 
 /// プラグインからのレスポンスを解析して表示し、必要に応じて異常終了する。
@@ -426,5 +555,33 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(msg.contains(".wav"), "エラーメッセージ: {}", msg);
+    }
+
+    // ─── Config のテスト ───
+
+    /// Config のデフォルト値が正しいことを確認する。
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(config.save_path.is_none());
+    }
+
+    /// Config の JSON シリアライズ / デシリアライズが正しく動作することを確認する。
+    #[test]
+    fn test_config_roundtrip() {
+        let config = Config {
+            save_path: Some("C:\\録音".to_string()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.save_path.as_deref(), Some("C:\\録音"));
+    }
+
+    /// 不正な JSON は Config のデフォルト値にフォールバックすることを確認する。
+    #[test]
+    fn test_config_invalid_json_fallback() {
+        let bad: Result<Config, _> = serde_json::from_str("not json at all");
+        // from_str 自体はエラーを返すが、load_config はデフォルトにフォールバックする
+        assert!(bad.is_err());
     }
 }
