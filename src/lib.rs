@@ -35,7 +35,7 @@
 //! - 最大ペイロード長：65,536 バイト
 
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -43,7 +43,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 
 use aviutl2::AnyResult;
-use aviutl2::generic::{GenericPlugin, GenericPluginTable, HostAppHandle};
+use aviutl2::generic::{EditHandle, GenericPlugin, GenericPluginTable, HostAppHandle};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
@@ -561,8 +561,11 @@ impl GenericPlugin for AudioRecPlugin {
     }
 
     /// プラグインをホストに登録し、ワーカースレッドを起動する。
-    fn register(&mut self, _registry: &mut HostAppHandle) {
+    fn register(&mut self, registry: &mut HostAppHandle) {
         tracing::info!("プラグインをホストに登録中...");
+
+        // 編集ハンドルを取得してワーカースレッドに move する
+        let handle = Arc::new(registry.create_edit_handle());
 
         let flag = Arc::clone(&self.shutdown_flag);
         let active_pipe = Arc::clone(&self.active_pipe);
@@ -571,7 +574,7 @@ impl GenericPlugin for AudioRecPlugin {
             .spawn(move || {
                 tracing::info!("Named Pipe サーバースレッドを開始しました");
                 let mut recorder = CpalHoundRecorder::new();
-                pipe_server_loop(flag, active_pipe, &mut recorder);
+                pipe_server_loop(flag, active_pipe, &mut recorder, handle);
                 tracing::info!("Named Pipe サーバースレッドを終了しました");
             }) {
             Ok(t) => t,
@@ -663,7 +666,8 @@ fn init_logging() {
 // Named Pipe サーバーループ
 // ─────────────────────────────────────────────────────────────
 
-/// Named Pipe サーバーのメインループ。
+/// WAV ファイルの長さが不明な場合に使用するデフォルトのフレーム数。
+const DEFAULT_FRAME_LENGTH: usize = 60;
 ///
 /// シャットダウンフラグが `true` になるまで、クライアントの接続→コマンド受信→
 /// レスポンス送信を繰り返す。
@@ -673,11 +677,16 @@ fn init_logging() {
 /// * `shutdown` - シャットダウン要求を示すアトミックフラグ
 /// * `active_pipe` - 現在接続中のパイプハンドルを共有するコンテナ
 /// * `recorder` - 音声録音器
+/// * `edit_handle` - AviUtl2 編集ハンドル（タイムライン挿入に使用）
 fn pipe_server_loop(
     shutdown: Arc<AtomicBool>,
     active_pipe: Arc<Mutex<Option<SendableHandle>>>,
     recorder: &mut dyn AudioRecorder,
+    edit_handle: Arc<EditHandle>,
 ) {
+    // 現在録音中のファイルパスを追跡する
+    let mut current_recording_path: Option<PathBuf> = None;
+
     loop {
         // ─── パイプインスタンスを作成 ───
         let pipe = create_server_pipe();
@@ -723,19 +732,28 @@ fn pipe_server_loop(
         // ─── コマンドを処理してレスポンスを送信 ───
         match received {
             Ok(data) => {
-                let response = match String::from_utf8(data) {
+                let (response, insert_path) = match String::from_utf8(data) {
                     Ok(command) => {
                         tracing::info!("コマンドを受信しました: {}", command.trim());
-                        process_command(command.trim(), recorder)
+                        process_command(
+                            command.trim(),
+                            recorder,
+                            &mut current_recording_path,
+                        )
                     }
                     Err(e) => {
                         tracing::error!("UTF-8 デコードに失敗しました: {}", e);
-                        format!("err:UTF-8デコードエラー: {}", e)
+                        (format!("err:UTF-8デコードエラー: {}", e), None)
                     }
                 };
 
                 tracing::info!("レスポンスを送信します: {}", response);
                 let _ = write_pipe_message(pipe, response.as_bytes());
+
+                // 録音完了後のタイムライン挿入（パイプレスポンス送信後に実施）
+                if let Some(path) = insert_path {
+                    insert_into_timeline(&edit_handle, path);
+                }
             }
             Err(ReadPipeError::Oversized) => {
                 tracing::warn!(
@@ -767,7 +785,7 @@ fn pipe_server_loop(
 /// # コマンド形式
 ///
 /// - `start:<絶対パス>` — 指定パスへの録音を開始する
-/// - `stop` — 録音を停止する
+/// - `stop` — 録音を停止し、録音ファイルをタイムラインに挿入する
 ///
 /// # レスポンス形式
 ///
@@ -779,44 +797,180 @@ fn pipe_server_loop(
 ///
 /// * `command` - 受信したコマンド文字列（トリム済み）
 /// * `recorder` - 音声録音器
-fn process_command(command: &str, recorder: &mut dyn AudioRecorder) -> String {
+/// * `current_recording_path` - 現在録音中のファイルパス（stop 後のタイムライン挿入に使用）
+///
+/// # 戻り値
+///
+/// `(レスポンス文字列, タイムラインへ挿入するパス)`。
+/// 挿入不要の場合、第二要素は `None`。
+fn process_command(
+    command: &str,
+    recorder: &mut dyn AudioRecorder,
+    current_recording_path: &mut Option<PathBuf>,
+) -> (String, Option<PathBuf>) {
     if let Some(path_str) = command.strip_prefix("start:") {
         // ─── start コマンド ───
         if recorder.is_recording() {
             tracing::info!("既に録音中です（冪等処理）");
-            return "noop:既に録音中です".to_string();
+            return ("noop:既に録音中です".to_string(), None);
         }
         let path = Path::new(path_str);
         match recorder.start(path) {
             Ok(()) => {
                 tracing::info!("録音を開始しました: {}", path_str);
-                "ok".to_string()
+                *current_recording_path = Some(path.to_path_buf());
+                ("ok".to_string(), None)
             }
             Err(e) => {
                 tracing::error!("録音の開始に失敗しました: {}", e);
-                format!("err:{}", e)
+                (format!("err:{}", e), None)
             }
         }
     } else if command == "stop" {
         // ─── stop コマンド ───
         if !recorder.is_recording() {
             tracing::info!("録音していません（冪等処理）");
-            return "noop:録音していません".to_string();
+            return ("noop:録音していません".to_string(), None);
         }
         match recorder.stop() {
             Ok(()) => {
                 tracing::info!("録音を停止しました");
-                "ok".to_string()
+                let insert_path = current_recording_path.take();
+                ("ok".to_string(), insert_path)
             }
             Err(e) => {
                 // コールバックエラーを含む場合もここで報告
                 tracing::error!("録音の停止中にエラーが発生しました: {}", e);
-                format!("err:{}", e)
+                current_recording_path.take();
+                (format!("err:{}", e), None)
             }
         }
     } else {
         tracing::warn!("未知のコマンドを受信しました: {}", command);
-        format!("err:未知のコマンド: {}", command)
+        (format!("err:未知のコマンド: {}", command), None)
+    }
+}
+
+/// 録音完了後にオーディオファイルをタイムラインへ挿入する。
+///
+/// `call_edit_section` を使用してメインスレッド上で処理を実行する。
+/// カーソル位置（フレーム・レイヤー）に `create_object_from_alias` でオブジェクトを生成する。
+///
+/// # 引数
+///
+/// * `edit_handle` - AviUtl2 編集ハンドル
+/// * `path` - 挿入する WAV ファイルのパス
+fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
+    if !edit_handle.is_ready() {
+        tracing::warn!(
+            "EditHandle がまだ準備できていません。タイムライン挿入をスキップします: {}",
+            path.display()
+        );
+        return;
+    }
+
+    tracing::info!("タイムラインへ挿入します: {}", path.display());
+
+    match edit_handle.call_edit_section(move |edit_section| {
+        // ─── カーソル位置とレイヤーを取得 ───
+        let frame = edit_section.info.frame;
+        let layer = edit_section.info.layer;
+        let fps = edit_section.info.fps;
+
+        tracing::info!(
+            "タイムライン挿入: frame={}, layer={}, path={}",
+            frame,
+            layer,
+            path.display()
+        );
+
+        // ─── WAV ファイルの長さをフレーム数に換算 ───
+        let length_frames = compute_wav_length_frames(&path, fps);
+
+        // ─── エイリアス文字列を構築してオブジェクトを生成 ───
+        let alias = build_audio_file_alias(&path.to_string_lossy(), layer, frame, length_frames);
+
+        match edit_section.create_object_from_alias(&alias, layer, frame, length_frames) {
+            Ok(handle) => {
+                tracing::info!("タイムラインへの挿入に成功しました: {:?}", handle);
+            }
+            Err(e) => {
+                tracing::error!("タイムラインへの挿入に失敗しました: {:?}", e);
+            }
+        }
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::error!("call_edit_section の呼び出しに失敗しました: {:?}", e);
+        }
+    }
+}
+
+/// 音声ファイル入力オブジェクトのエイリアス文字列を生成する。
+///
+/// AviUtl2 のオブジェクトエイリアスフォーマット（INI 風テキスト）でシリアライズする。
+///
+/// フォーマット:
+/// ```text
+/// [0]
+/// layer=<レイヤー番号>
+/// frame=<開始フレーム>,<終了フレーム>
+/// [0.0]
+/// effect.name=音声ファイル
+/// ファイル=<ファイルパス>
+/// ```
+///
+/// `effect.name=音声ファイル` は AviUtl2 の標準音声入力エフェクトのエイリアス名。
+/// バージョンや設定によって異なる可能性がある。
+///
+/// # 引数
+///
+/// * `file_path` - 挿入する WAV ファイルのパス
+/// * `layer` - レイヤー番号（0始まり）
+/// * `frame` - 開始フレーム番号（0始まり）
+/// * `length_frames` - オブジェクトの長さ（フレーム数）
+fn build_audio_file_alias(file_path: &str, layer: usize, frame: usize, length_frames: usize) -> String {
+    let end_frame = frame + length_frames.saturating_sub(1);
+    format!(
+        "[0]\nlayer={layer}\nframe={frame},{end}\n[0.0]\neffect.name=音声ファイル\nファイル={path}\n",
+        layer = layer,
+        frame = frame,
+        end = end_frame,
+        path = file_path,
+    )
+}
+
+/// WAV ファイルの長さをフレーム数に換算する。
+///
+/// WAV ファイルを読み込んでサンプル数とサンプルレートから秒数を求め、
+/// プロジェクトのフレームレートに基づいてフレーム数に変換する。
+///
+/// # 引数
+///
+/// * `path` - WAV ファイルのパス
+/// * `fps` - プロジェクトのフレームレート（`numerator/denominator` の形式）
+///
+/// # 戻り値
+///
+/// フレーム数（最小 1）。WAV ファイルの読み込みに失敗した場合はデフォルト値 60 を返す。
+fn compute_wav_length_frames(path: &Path, fps: aviutl2::common::Rational32) -> usize {
+    match hound::WavReader::open(path) {
+        Ok(reader) => {
+            let spec = reader.spec();
+            let total_samples = reader.duration() as f64;
+            let duration_secs = total_samples / spec.sample_rate as f64;
+            let fps_f64 = *fps.numer() as f64 / *fps.denom() as f64;
+            let frames = (duration_secs * fps_f64).round() as usize;
+            frames.max(1)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "WAV ファイルの読み込みに失敗しました（長さの計算不可）: {} ({})",
+                path.display(),
+                e
+            );
+            DEFAULT_FRAME_LENGTH // WAV ファイルの読み込みに失敗した場合のデフォルト
+        }
     }
 }
 
@@ -1071,16 +1225,20 @@ mod tests {
     #[test]
     fn test_process_command_start_ok() {
         let mut recorder = MockRecorder::new();
-        let response = process_command("start:/tmp/test.wav", &mut recorder);
+        let mut path = None;
+        let (response, insert) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
+        assert!(insert.is_none());
+        assert_eq!(path.as_deref(), Some(Path::new("/tmp/test.wav")));
     }
 
     /// 録音中に `start` を送信した場合は冪等処理になることを確認する。
     #[test]
     fn test_process_command_start_noop_when_recording() {
         let mut recorder = MockRecorder::new().already_recording();
-        let response = process_command("start:/tmp/test.wav", &mut recorder);
+        let mut path = None;
+        let (response, _) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
         assert!(response.starts_with("noop:"), "response was: {}", response);
     }
 
@@ -1088,16 +1246,21 @@ mod tests {
     #[test]
     fn test_process_command_stop_ok() {
         let mut recorder = MockRecorder::new().already_recording();
-        let response = process_command("stop", &mut recorder);
+        let mut current = Some(PathBuf::from("/tmp/test.wav"));
+        let (response, insert) = process_command("stop", &mut recorder, &mut current);
         assert_eq!(response, "ok");
         assert!(!recorder.is_recording());
+        // stop 後は挿入パスが返され、current_path はクリアされる
+        assert_eq!(insert.as_deref(), Some(Path::new("/tmp/test.wav")));
+        assert!(current.is_none());
     }
 
     /// 録音していない状態で `stop` を送信した場合は冪等処理になることを確認する。
     #[test]
     fn test_process_command_stop_noop_when_idle() {
         let mut recorder = MockRecorder::new();
-        let response = process_command("stop", &mut recorder);
+        let mut path = None;
+        let (response, _) = process_command("stop", &mut recorder, &mut path);
         assert!(response.starts_with("noop:"), "response was: {}", response);
     }
 
@@ -1105,7 +1268,8 @@ mod tests {
     #[test]
     fn test_process_command_start_error() {
         let mut recorder = MockRecorder::new().with_start_error("デバイスエラー");
-        let response = process_command("start:/tmp/test.wav", &mut recorder);
+        let mut path = None;
+        let (response, _) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("デバイスエラー"));
     }
@@ -1116,17 +1280,46 @@ mod tests {
         let mut recorder = MockRecorder::new()
             .already_recording()
             .with_stop_error("ファイナライズ失敗");
-        let response = process_command("stop", &mut recorder);
+        let mut current = Some(PathBuf::from("/tmp/test.wav"));
+        let (response, insert) = process_command("stop", &mut recorder, &mut current);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("ファイナライズ失敗"));
+        assert!(insert.is_none()); // エラー時は挿入しない
     }
 
     /// 未知のコマンドは `err:` として返されることを確認する。
     #[test]
     fn test_process_command_unknown() {
         let mut recorder = MockRecorder::new();
-        let response = process_command("unknown_cmd", &mut recorder);
+        let mut path = None;
+        let (response, _) = process_command("unknown_cmd", &mut recorder, &mut path);
         assert!(response.starts_with("err:"), "response was: {}", response);
+    }
+
+    // ─── build_audio_file_alias のテスト ───
+
+    /// エイリアス文字列が正しいフォーマットで生成されることを確認する。
+    #[test]
+    fn test_build_audio_file_alias() {
+        let alias = build_audio_file_alias("C:\\rec\\output.wav", 2, 10, 60);
+        assert!(alias.contains("[0]"), "オブジェクトセクションが必要: {}", alias);
+        assert!(alias.contains("layer=2"), "レイヤー番号が必要: {}", alias);
+        assert!(alias.contains("frame=10,"), "開始フレームが必要: {}", alias);
+        assert!(alias.contains("[0.0]"), "エフェクトセクションが必要: {}", alias);
+        assert!(alias.contains("effect.name=音声ファイル"), "エフェクト名が必要: {}", alias);
+        assert!(
+            alias.contains("ファイル=C:\\rec\\output.wav"),
+            "ファイルパスが必要: {}",
+            alias
+        );
+    }
+
+    /// フレーム数が 0 の場合に end フレームが start フレームと同じになることを確認する。
+    #[test]
+    fn test_build_audio_file_alias_zero_length() {
+        let alias = build_audio_file_alias("C:\\rec\\empty.wav", 0, 5, 0);
+        // length=0 の場合 end = 5 + 0.saturating_sub(1) = 5 + 0 = 5
+        assert!(alias.contains("frame=5,5"), "ゼロ長の場合: {}", alias);
     }
 
     // ─── CpalHoundRecorder の冪等性テスト ───
@@ -1145,5 +1338,74 @@ mod tests {
     fn test_cpal_recorder_initial_state() {
         let recorder = CpalHoundRecorder::new();
         assert!(!recorder.is_recording());
+    }
+
+    // ─── compute_wav_length_frames のテスト ───
+
+    /// 正常な WAV ファイルから期待フレーム数が計算されることを確認する。
+    ///
+    /// 1秒の 44100 Hz 16-bit モノラル WAV を 60fps プロジェクトで読むと 60 フレームになるはず。
+    #[test]
+    fn test_compute_wav_length_frames_normal() {
+        // 一時ファイルに 1秒分（44100 サンプル）のサイレント WAV を書き込む
+        let path = std::env::temp_dir().join("test_compute_wav_len.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 44100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for _ in 0..44100 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let fps = aviutl2::common::Rational32::new(60, 1); // 60 fps
+        let frames = compute_wav_length_frames(&path, fps);
+        assert_eq!(frames, 60, "1秒 × 60fps = 60 フレームのはず");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 存在しない WAV ファイルは `DEFAULT_FRAME_LENGTH` を返すことを確認する。
+    #[test]
+    fn test_compute_wav_length_frames_missing_file() {
+        let path = std::path::Path::new("/nonexistent/path/audio.wav");
+        let fps = aviutl2::common::Rational32::new(30, 1); // 30 fps
+        let frames = compute_wav_length_frames(path, fps);
+        assert_eq!(
+            frames, DEFAULT_FRAME_LENGTH,
+            "読み込み失敗時はデフォルト値のはず"
+        );
+    }
+
+    /// 0.5秒の WAV を 24fps で読むと 12 フレームになることを確認する。
+    #[test]
+    fn test_compute_wav_length_frames_fractional() {
+        let path = std::env::temp_dir().join("test_compute_wav_half.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 48000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            // 0.5秒 = 24000 サンプル（ステレオなので各チャネル 24000）
+            for _ in 0..24000 {
+                writer.write_sample(0i16).unwrap(); // L
+                writer.write_sample(0i16).unwrap(); // R
+            }
+            writer.finalize().unwrap();
+        }
+
+        let fps = aviutl2::common::Rational32::new(24, 1); // 24 fps
+        let frames = compute_wav_length_frames(&path, fps);
+        assert_eq!(frames, 12, "0.5秒 × 24fps = 12 フレームのはず");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
