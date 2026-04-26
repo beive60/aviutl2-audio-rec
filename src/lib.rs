@@ -676,7 +676,8 @@ fn init_logging() {
 // Named Pipe サーバーループ
 // ─────────────────────────────────────────────────────────────
 
-/// Named Pipe サーバーのメインループ。
+/// WAV ファイルの長さが不明な場合に使用するデフォルトのフレーム数。
+const DEFAULT_FRAME_LENGTH: usize = 60;
 ///
 /// シャットダウンフラグが `true` になるまで、クライアントの接続→コマンド受信→
 /// レスポンス送信を繰り返す。
@@ -897,17 +898,7 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
         let length_frames = compute_wav_length_frames(&path, fps);
 
         // ─── エイリアス文字列を構築してオブジェクトを生成 ───
-        // AviUtl2 のオブジェクトエイリアスフォーマット（INI 風テキスト）を使用する。
-        // 音声ファイル入力オブジェクトとして登録する。
-        // 注意: effect.name の正確な値は AviUtl2 のバージョン・設定によって異なる場合がある。
-        let path_str = path.to_string_lossy();
-        let alias = format!(
-            "[0]\nlayer={layer}\nframe={frame},{end}\n[0.0]\neffect.name=音声ファイル\nファイル={path}\n",
-            layer = layer,
-            frame = frame,
-            end = frame + length_frames.saturating_sub(1),
-            path = path_str,
-        );
+        let alias = build_audio_file_alias(&path.to_string_lossy(), layer, frame, length_frames);
 
         match edit_section.create_object_from_alias(&alias, layer, frame, length_frames) {
             Ok(handle) => {
@@ -923,6 +914,40 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
             tracing::error!("call_edit_section の呼び出しに失敗しました: {:?}", e);
         }
     }
+}
+
+/// 音声ファイル入力オブジェクトのエイリアス文字列を生成する。
+///
+/// AviUtl2 のオブジェクトエイリアスフォーマット（INI 風テキスト）でシリアライズする。
+///
+/// フォーマット:
+/// ```text
+/// [0]
+/// layer=<レイヤー番号>
+/// frame=<開始フレーム>,<終了フレーム>
+/// [0.0]
+/// effect.name=音声ファイル
+/// ファイル=<ファイルパス>
+/// ```
+///
+/// `effect.name=音声ファイル` は AviUtl2 の標準音声入力エフェクトのエイリアス名。
+/// バージョンや設定によって異なる可能性がある。
+///
+/// # 引数
+///
+/// * `file_path` - 挿入する WAV ファイルのパス
+/// * `layer` - レイヤー番号（0始まり）
+/// * `frame` - 開始フレーム番号（0始まり）
+/// * `length_frames` - オブジェクトの長さ（フレーム数）
+fn build_audio_file_alias(file_path: &str, layer: usize, frame: usize, length_frames: usize) -> String {
+    let end_frame = frame + length_frames.saturating_sub(1);
+    format!(
+        "[0]\nlayer={layer}\nframe={frame},{end}\n[0.0]\neffect.name=音声ファイル\nファイル={path}\n",
+        layer = layer,
+        frame = frame,
+        end = end_frame,
+        path = file_path,
+    )
 }
 
 /// WAV ファイルの長さをフレーム数に換算する。
@@ -954,7 +979,7 @@ fn compute_wav_length_frames(path: &Path, fps: aviutl2::common::Rational32) -> u
                 path.display(),
                 e
             );
-            60 // デフォルト: 60 フレーム
+            DEFAULT_FRAME_LENGTH // WAV ファイルの読み込みに失敗した場合のデフォルト
         }
     }
 }
@@ -1279,6 +1304,32 @@ mod tests {
         let mut path = None;
         let (response, _) = process_command("unknown_cmd", &mut recorder, &mut path);
         assert!(response.starts_with("err:"), "response was: {}", response);
+    }
+
+    // ─── build_audio_file_alias のテスト ───
+
+    /// エイリアス文字列が正しいフォーマットで生成されることを確認する。
+    #[test]
+    fn test_build_audio_file_alias() {
+        let alias = build_audio_file_alias("C:\\rec\\output.wav", 2, 10, 60);
+        assert!(alias.contains("[0]"), "オブジェクトセクションが必要: {}", alias);
+        assert!(alias.contains("layer=2"), "レイヤー番号が必要: {}", alias);
+        assert!(alias.contains("frame=10,"), "開始フレームが必要: {}", alias);
+        assert!(alias.contains("[0.0]"), "エフェクトセクションが必要: {}", alias);
+        assert!(alias.contains("effect.name=音声ファイル"), "エフェクト名が必要: {}", alias);
+        assert!(
+            alias.contains("ファイル=C:\\rec\\output.wav"),
+            "ファイルパスが必要: {}",
+            alias
+        );
+    }
+
+    /// フレーム数が 0 の場合に end フレームが start フレームと同じになることを確認する。
+    #[test]
+    fn test_build_audio_file_alias_zero_length() {
+        let alias = build_audio_file_alias("C:\\rec\\empty.wav", 0, 5, 0);
+        // length=0 の場合 end = 5 + 0.saturating_sub(1) = 5 + 0 = 5
+        assert!(alias.contains("frame=5,5"), "ゼロ長の場合: {}", alias);
     }
 
     // ─── CpalHoundRecorder の冪等性テスト ───
