@@ -528,11 +528,6 @@ pub struct AudioRecPlugin {
     /// `ReadFile` でブロック中の場合は `Some` が設定されており、
     /// `Drop` から `DisconnectNamedPipe` を呼び出して I/O を中断できる。
     active_pipe: Arc<Mutex<Option<SendableHandle>>>,
-
-    /// AviUtl2 の編集ハンドル。
-    /// `register()` 後に設定される。ワーカースレッドが `call_edit_section` を
-    /// 呼び出してメインスレッド上でタイムライン挿入を行うために使用する。
-    edit_handle: Arc<Mutex<Option<Arc<EditHandle>>>>,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -550,7 +545,6 @@ impl GenericPlugin for AudioRecPlugin {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             worker_thread: Mutex::new(None),
             active_pipe: Arc::new(Mutex::new(None)),
-            edit_handle: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -570,12 +564,8 @@ impl GenericPlugin for AudioRecPlugin {
     fn register(&mut self, registry: &mut HostAppHandle) {
         tracing::info!("プラグインをホストに登録中...");
 
-        // 編集ハンドルを取得してスレッド間で共有できるよう Arc に格納する
+        // 編集ハンドルを取得してワーカースレッドに move する
         let handle = Arc::new(registry.create_edit_handle());
-        match self.edit_handle.lock() {
-            Ok(mut g) => *g = Some(Arc::clone(&handle)),
-            Err(e) => tracing::error!("edit_handle Mutex が汚染されています: {}", e),
-        }
 
         let flag = Arc::clone(&self.shutdown_flag);
         let active_pipe = Arc::clone(&self.active_pipe);
@@ -1348,5 +1338,74 @@ mod tests {
     fn test_cpal_recorder_initial_state() {
         let recorder = CpalHoundRecorder::new();
         assert!(!recorder.is_recording());
+    }
+
+    // ─── compute_wav_length_frames のテスト ───
+
+    /// 正常な WAV ファイルから期待フレーム数が計算されることを確認する。
+    ///
+    /// 1秒の 44100 Hz 16-bit モノラル WAV を 60fps プロジェクトで読むと 60 フレームになるはず。
+    #[test]
+    fn test_compute_wav_length_frames_normal() {
+        // 一時ファイルに 1秒分（44100 サンプル）のサイレント WAV を書き込む
+        let path = std::env::temp_dir().join("test_compute_wav_len.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 44100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for _ in 0..44100 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let fps = aviutl2::common::Rational32::new(60, 1); // 60 fps
+        let frames = compute_wav_length_frames(&path, fps);
+        assert_eq!(frames, 60, "1秒 × 60fps = 60 フレームのはず");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 存在しない WAV ファイルは `DEFAULT_FRAME_LENGTH` を返すことを確認する。
+    #[test]
+    fn test_compute_wav_length_frames_missing_file() {
+        let path = std::path::Path::new("/nonexistent/path/audio.wav");
+        let fps = aviutl2::common::Rational32::new(30, 1); // 30 fps
+        let frames = compute_wav_length_frames(path, fps);
+        assert_eq!(
+            frames, DEFAULT_FRAME_LENGTH,
+            "読み込み失敗時はデフォルト値のはず"
+        );
+    }
+
+    /// 0.5秒の WAV を 24fps で読むと 12 フレームになることを確認する。
+    #[test]
+    fn test_compute_wav_length_frames_fractional() {
+        let path = std::env::temp_dir().join("test_compute_wav_half.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 48000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            // 0.5秒 = 24000 サンプル（ステレオなので各チャネル 24000）
+            for _ in 0..24000 {
+                writer.write_sample(0i16).unwrap(); // L
+                writer.write_sample(0i16).unwrap(); // R
+            }
+            writer.finalize().unwrap();
+        }
+
+        let fps = aviutl2::common::Rational32::new(24, 1); // 24 fps
+        let frames = compute_wav_length_frames(&path, fps);
+        assert_eq!(frames, 12, "0.5秒 × 24fps = 12 フレームのはず");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

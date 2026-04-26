@@ -105,8 +105,14 @@ fn get_config_path() -> PathBuf {
 ///
 /// ファイルが存在しない場合やパースに失敗した場合はデフォルト設定を返す。
 fn load_config() -> Config {
-    let path = get_config_path();
-    match std::fs::read_to_string(&path) {
+    load_config_from_path(&get_config_path())
+}
+
+/// 指定したパスから設定ファイルを読み込む。
+///
+/// ファイルが存在しない場合やパースに失敗した場合はデフォルト設定を返す。
+fn load_config_from_path(path: &std::path::Path) -> Config {
+    match std::fs::read_to_string(path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => Config::default(),
     }
@@ -174,7 +180,13 @@ fn main() {
             // ─── start コマンド ───
             // パス指定あり: audio_rec_cli.exe start <path>
             // パス省略:     audio_rec_cli.exe start  （設定ファイルのパス + タイムスタンプ）
-            let output_path: String = if args.len() >= 3 {
+            if args.len() != 2 && args.len() != 3 {
+                eprintln!("エラー: 'start' コマンドの引数が不正です（引数は 0 個または 1 個）");
+                print_usage(&args[0]);
+                process::exit(1);
+            }
+
+            let output_path: String = if args.len() == 3 {
                 args[2].clone()
             } else {
                 // デフォルト保存先を設定ファイルから読み込む
@@ -237,13 +249,24 @@ fn main() {
 
             let dir = &args[3];
 
-            // ディレクトリの存在チェック
-            if !Path::new(dir).exists() {
-                eprintln!(
-                    "エラー: 指定したディレクトリが存在しません: {}",
-                    dir
-                );
-                process::exit(1);
+            // ディレクトリの存在と種別をチェック
+            match Path::new(dir).metadata() {
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        eprintln!(
+                            "エラー: 指定したパスはディレクトリではありません: {}",
+                            dir
+                        );
+                        process::exit(1);
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "エラー: 指定したディレクトリが存在しません: {}",
+                        dir
+                    );
+                    process::exit(1);
+                }
             }
 
             let mut config = load_config();
@@ -577,11 +600,28 @@ mod tests {
         assert_eq!(restored.save_path.as_deref(), Some("C:\\録音"));
     }
 
-    /// 不正な JSON は Config のデフォルト値にフォールバックすることを確認する。
+    /// 不正な JSON の設定ファイルを `load_config_from_path` がデフォルト値にフォールバックして読み込むことを確認する。
     #[test]
     fn test_config_invalid_json_fallback() {
-        let bad: Result<Config, _> = serde_json::from_str("not json at all");
-        // from_str 自体はエラーを返すが、load_config はデフォルトにフォールバックする
-        assert!(bad.is_err());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aviutl2_config_invalid_{unique}.json"));
+        std::fs::write(&path, "not json at all").unwrap();
+
+        let config = load_config_from_path(&path);
+        assert!(config.save_path.is_none(), "不正JSONはデフォルトにフォールバックするはず");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 設定ファイルが存在しない場合は `load_config_from_path` がデフォルト値を返すことを確認する。
+    #[test]
+    fn test_config_missing_file_fallback() {
+        let path = std::env::temp_dir().join("aviutl2_config_definitely_not_here_xyzzy.json");
+        let _ = std::fs::remove_file(&path); // 念のため削除
+        let config = load_config_from_path(&path);
+        assert!(config.save_path.is_none(), "ファイル未存在時はデフォルトにフォールバックするはず");
     }
 }
