@@ -857,7 +857,7 @@ fn process_command(
 ///
 /// `call_edit_section` を使用してメインスレッド上で処理を実行する。
 /// カーソル位置（フレーム・レイヤー）への挿入を試み、既存オブジェクトと重複する場合は
-/// [`timeline_inserter::insert_at_available_frame`] を通じて挿入可能な位置をロールバック探索する。
+/// [`timeline_inserter::insert_at_available_frame`] を通じて挿入可能な位置をフォールバック探索する。
 ///
 /// # 引数
 ///
@@ -894,7 +894,7 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
         // ─── 挿入可能な位置を探索してオブジェクトを生成 ───
         // 目標フレームに既存オブジェクトが存在する場合は、
         // timeline_inserter モジュールが 1 フレームずつ前進しながら
-        // 挿入可能な位置をロールバック探索する。
+        // 挿入可能な位置をフォールバック探索する。
         let result = timeline_inserter::insert_at_available_frame(
             layer,
             frame,
@@ -917,7 +917,7 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
                     );
                 } else {
                     tracing::info!(
-                        "タイムラインへの挿入に成功しました（ロールバック先）: \
+                        "タイムラインへの挿入に成功しました（フォールバック先）: \
                          target_frame={}, actual_frame={}",
                         frame,
                         actual_frame
