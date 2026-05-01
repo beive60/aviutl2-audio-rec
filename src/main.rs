@@ -9,6 +9,7 @@
 //! audio_rec_cli.exe start [<WAVファイルの絶対パス>]
 //! audio_rec_cli.exe stop
 //! audio_rec_cli.exe config save-path <ディレクトリパス>
+//! audio_rec_cli.exe config buffer-size <フレーム数>
 //! ```
 //!
 //! ## 動作概要
@@ -35,6 +36,12 @@
 //!
 //! デフォルトの録音ファイル保存先ディレクトリを設定ファイル（JSON）に保存する。
 //! 設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに置かれる。
+//!
+//! ### config buffer-size コマンド
+//!
+//! cpal 入力ストリームのバッファサイズ（フレーム数）を設定ファイル（JSON）に保存する。
+//! 録音した音声がぷつぷつ途切れる場合は大きな値（例: `4096`）を試すこと。
+//! `0` を指定するとデフォルト値に戻す。設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに置かれる。
 //!
 //! ## エラー処理
 //!
@@ -87,6 +94,10 @@ struct Config {
     /// デフォルトの録音ファイル保存先ディレクトリ。
     /// 未設定の場合は `None`。
     save_path: Option<String>,
+    /// cpal 入力ストリームのバッファサイズ（フレーム数）。
+    /// 値が大きいほど音声途切れ（ぷつぷつ）が発生しにくくなる（レイテンシは増加する）。
+    /// 未設定または `0` の場合はデバイスのデフォルト値を使用する。
+    buffer_size_frames: Option<u32>,
 }
 
 /// 設定ファイルのパスを返す。
@@ -127,8 +138,13 @@ fn save_config(config: &Config) -> Result<(), String> {
     let path = get_config_path();
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("設定のシリアライズに失敗しました: {}", e))?;
-    std::fs::write(&path, content)
-        .map_err(|e| format!("設定ファイルの書き込みに失敗しました: {} ({})", path.display(), e))
+    std::fs::write(&path, content).map_err(|e| {
+        format!(
+            "設定ファイルの書き込みに失敗しました: {} ({})",
+            path.display(),
+            e
+        )
+    })
 }
 
 /// 現在のローカル日時を `yyyymmdd-hhmmss` 形式の文字列として返す。
@@ -186,11 +202,13 @@ fn main() {
                 process::exit(1);
             }
 
+            // 設定ファイルを読み込む（保存先パスとバッファサイズの両方に使用）
+            let config = load_config();
+
             let output_path: String = if args.len() == 3 {
                 args[2].clone()
             } else {
                 // デフォルト保存先を設定ファイルから読み込む
-                let config = load_config();
                 let dir = match config.save_path {
                     Some(ref d) => d.clone(),
                     None => {
@@ -215,7 +233,10 @@ fn main() {
 
             println!("録音先: {}", output_path);
 
-            let command = format!("start:{}", output_path);
+            // バッファサイズを設定ファイルから取得し、プロトコル形式に含める。
+            // 形式: `start:<buffer_frames>:<path>`（buffer_frames=0 はデフォルト）
+            let buffer_frames = config.buffer_size_frames.unwrap_or(0);
+            let command = format!("start:{}:{}", buffer_frames, output_path);
             match send_command_and_read_response(&command) {
                 Ok(response) => handle_response(&response),
                 Err(msg) => {
@@ -238,47 +259,95 @@ fn main() {
 
         "config" => {
             // ─── config サブコマンド ───
-            if args.len() < 4 || args[2].as_str() != "save-path" {
+            if args.len() < 4 {
                 eprintln!("エラー: 'config' サブコマンドの使い方が正しくありません。");
-                eprintln!(
-                    "使用方法: {} config save-path <ディレクトリ>",
-                    args[0]
-                );
+                print_usage(&args[0]);
                 process::exit(1);
             }
 
-            let dir = &args[3];
+            match args[2].as_str() {
+                "save-path" => {
+                    let dir = &args[3];
 
-            // ディレクトリの存在と種別をチェック
-            match Path::new(dir).metadata() {
-                Ok(metadata) => {
-                    if !metadata.is_dir() {
-                        eprintln!(
-                            "エラー: 指定したパスはディレクトリではありません: {}",
-                            dir
-                        );
-                        process::exit(1);
+                    // ディレクトリの存在と種別をチェック
+                    match Path::new(dir).metadata() {
+                        Ok(metadata) => {
+                            if !metadata.is_dir() {
+                                eprintln!(
+                                    "エラー: 指定したパスはディレクトリではありません: {}",
+                                    dir
+                                );
+                                process::exit(1);
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("エラー: 指定したディレクトリが存在しません: {}", dir);
+                            process::exit(1);
+                        }
+                    }
+
+                    let mut config = load_config();
+                    config.save_path = Some(dir.clone());
+
+                    match save_config(&config) {
+                        Ok(()) => {
+                            println!("デフォルト保存先を設定しました: {}", dir);
+                            println!("設定ファイル: {}", get_config_path().display());
+                        }
+                        Err(msg) => {
+                            eprintln!("エラー: {}", msg);
+                            process::exit(1);
+                        }
                     }
                 }
-                Err(_) => {
-                    eprintln!(
-                        "エラー: 指定したディレクトリが存在しません: {}",
-                        dir
-                    );
-                    process::exit(1);
-                }
-            }
 
-            let mut config = load_config();
-            config.save_path = Some(dir.clone());
+                "buffer-size" => {
+                    // cpal 入力ストリームのバッファサイズ（フレーム数）を設定する。
+                    // 音声がぷつぷつ途切れる場合は大きな値（例: 4096）を試す。
+                    // 0 を指定するとデフォルト値に戻す。
+                    let raw = &args[3];
+                    let frames: u32 = match raw.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!(
+                                "エラー: バッファサイズは 0 以上の整数で指定してください: {}",
+                                raw
+                            );
+                            process::exit(1);
+                        }
+                    };
 
-            match save_config(&config) {
-                Ok(()) => {
-                    println!("デフォルト保存先を設定しました: {}", dir);
-                    println!("設定ファイル: {}", get_config_path().display());
+                    let mut config = load_config();
+                    if frames == 0 {
+                        config.buffer_size_frames = None;
+                        match save_config(&config) {
+                            Ok(()) => {
+                                println!("バッファサイズをデフォルトに戻しました。");
+                                println!("設定ファイル: {}", get_config_path().display());
+                            }
+                            Err(msg) => {
+                                eprintln!("エラー: {}", msg);
+                                process::exit(1);
+                            }
+                        }
+                    } else {
+                        config.buffer_size_frames = Some(frames);
+                        match save_config(&config) {
+                            Ok(()) => {
+                                println!("バッファサイズを {} フレームに設定しました。", frames);
+                                println!("設定ファイル: {}", get_config_path().display());
+                            }
+                            Err(msg) => {
+                                eprintln!("エラー: {}", msg);
+                                process::exit(1);
+                            }
+                        }
+                    }
                 }
-                Err(msg) => {
-                    eprintln!("エラー: {}", msg);
+
+                sub => {
+                    eprintln!("エラー: 未知の config サブコマンド '{}'", sub);
+                    print_usage(&args[0]);
                     process::exit(1);
                 }
             }
@@ -295,18 +364,35 @@ fn main() {
 /// 使用方法を標準エラー出力に表示する。
 fn print_usage(program: &str) {
     eprintln!("使用方法:");
-    eprintln!("  {} start [<WAVファイルの絶対パス>]  -- 録音を開始する（パス省略時はデフォルト保存先を使用）", program);
-    eprintln!("  {} stop                              -- 録音を停止する", program);
+    eprintln!(
+        "  {} start [<WAVファイルの絶対パス>]  -- 録音を開始する（パス省略時はデフォルト保存先を使用）",
+        program
+    );
+    eprintln!(
+        "  {} stop                              -- 録音を停止する",
+        program
+    );
     eprintln!(
         "  {} config save-path <ディレクトリ>   -- デフォルト保存先を設定する",
+        program
+    );
+    eprintln!(
+        "  {} config buffer-size <フレーム数>   -- 録音バッファサイズを設定する（0 でデフォルトに戻す）",
         program
     );
     eprintln!();
     eprintln!("例:");
     eprintln!("  {} start \"C:\\録音\\output.wav\"", program);
-    eprintln!("  {} start  # デフォルト保存先 + タイムスタンプ名で録音開始", program);
+    eprintln!(
+        "  {} start  # デフォルト保存先 + タイムスタンプ名で録音開始",
+        program
+    );
     eprintln!("  {} stop", program);
     eprintln!("  {} config save-path \"C:\\録音\"", program);
+    eprintln!(
+        "  {} config buffer-size 4096  # 音声がぷつぷつ途切れる場合に試す",
+        program
+    );
 }
 
 /// プラグインからのレスポンスを解析して表示し、必要に応じて異常終了する。
@@ -547,8 +633,7 @@ mod tests {
     /// 存在しないディレクトリへのパスはエラーになることを確認する。
     #[test]
     fn test_validate_path_nonexistent_directory() {
-        let result =
-            validate_output_path("/nonexistent_dir_12345/subdir/output.wav");
+        let result = validate_output_path("/nonexistent_dir_12345/subdir/output.wav");
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(
@@ -611,7 +696,10 @@ mod tests {
         std::fs::write(&path, "not json at all").unwrap();
 
         let config = load_config_from_path(&path);
-        assert!(config.save_path.is_none(), "不正JSONはデフォルトにフォールバックするはず");
+        assert!(
+            config.save_path.is_none(),
+            "不正JSONはデフォルトにフォールバックするはず"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -622,6 +710,9 @@ mod tests {
         let path = std::env::temp_dir().join("aviutl2_config_definitely_not_here_xyzzy.json");
         let _ = std::fs::remove_file(&path); // 念のため削除
         let config = load_config_from_path(&path);
-        assert!(config.save_path.is_none(), "ファイル未存在時はデフォルトにフォールバックするはず");
+        assert!(
+            config.save_path.is_none(),
+            "ファイル未存在時はデフォルトにフォールバックするはず"
+        );
     }
 }

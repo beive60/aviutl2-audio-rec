@@ -45,16 +45,14 @@ use std::thread::JoinHandle;
 use aviutl2::AnyResult;
 use aviutl2::generic::{EditHandle, GenericPlugin, GenericPluginTable, HostAppHandle};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
-    PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT, ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+    PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::core::PCWSTR;
 
@@ -107,11 +105,14 @@ pub trait AudioRecorder: Send {
     /// # 引数
     ///
     /// * `output_path` - WAV ファイルの出力先パス
+    /// * `buffer_size` - cpal ストリームのバッファサイズ（フレーム数）。
+    ///   `None` または `Some(0)` の場合はデバイスのデフォルト値を使用する。
+    ///   値が大きいほど音声途切れが発生しにくくなる（レイテンシは増加する）。
     ///
     /// # 戻り値
     ///
     /// 成功時は `Ok(())`。失敗時はエラーメッセージ。
-    fn start(&mut self, output_path: &Path) -> Result<(), String>;
+    fn start(&mut self, output_path: &Path, buffer_size: Option<u32>) -> Result<(), String>;
 
     /// 録音を停止する。
     ///
@@ -186,7 +187,7 @@ impl Default for CpalHoundRecorder {
 }
 
 impl AudioRecorder for CpalHoundRecorder {
-    fn start(&mut self, output_path: &Path) -> Result<(), String> {
+    fn start(&mut self, output_path: &Path, buffer_size: Option<u32>) -> Result<(), String> {
         // 冪等処理：既に録音中なら何もしない
         if self.is_recording() {
             return Ok(());
@@ -227,10 +228,19 @@ impl AudioRecorder for CpalHoundRecorder {
             Arc::new(Mutex::new(Some(wav_writer)));
         let callback_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+        // ─── cpal ストリーム設定を構築 ───
+        // バッファサイズが指定されている場合は Fixed を使用する。
+        // 大きなバッファはコールバック呼び出し頻度を下げ、ディスク I/O 起因の
+        // 音声途切れ（ぷつぷつ）を軽減する効果がある。
+        let mut stream_config: cpal::StreamConfig = supported_config.clone().into();
+        if let Some(frames) = buffer_size.filter(|&n| n > 0) {
+            stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+        }
+
         // ─── cpal ストリームを構築（デバイスの実フォーマットに合わせた型で構築） ───
         let stream = build_input_stream(
             &device,
-            &supported_config.into(),
+            &stream_config,
             cpal_format,
             Arc::clone(&writer),
             Arc::clone(&callback_error),
@@ -421,9 +431,10 @@ fn write_samples_i16(
         if let Err(e) = w.write_sample(sample) {
             // エラーをメインスレッドへ通知
             if let Ok(mut err_guard) = callback_error.try_lock()
-                && err_guard.is_none() {
-                    *err_guard = Some(format!("サンプル書き込みエラー (i16): {}", e));
-                }
+                && err_guard.is_none()
+            {
+                *err_guard = Some(format!("サンプル書き込みエラー (i16): {}", e));
+            }
             // ライターをドロップしてファイルを閉じる（以降の書き込みを停止）
             drop(guard.take());
             return;
@@ -454,9 +465,10 @@ fn write_samples_i32(
         if let Err(e) = w.write_sample(sample) {
             // エラーをメインスレッドへ通知
             if let Ok(mut err_guard) = callback_error.try_lock()
-                && err_guard.is_none() {
-                    *err_guard = Some(format!("サンプル書き込みエラー (i32): {}", e));
-                }
+                && err_guard.is_none()
+            {
+                *err_guard = Some(format!("サンプル書き込みエラー (i32): {}", e));
+            }
             // ライターをドロップしてファイルを閉じる（以降の書き込みを停止）
             drop(guard.take());
             return;
@@ -487,9 +499,10 @@ fn write_samples_f32(
         if let Err(e) = w.write_sample(sample) {
             // エラーをメインスレッドへ通知
             if let Ok(mut err_guard) = callback_error.try_lock()
-                && err_guard.is_none() {
-                    *err_guard = Some(format!("サンプル書き込みエラー (f32): {}", e));
-                }
+                && err_guard.is_none()
+            {
+                *err_guard = Some(format!("サンプル書き込みエラー (f32): {}", e));
+            }
             // ライターをドロップしてファイルを閉じる（以降の書き込みを停止）
             drop(guard.take());
             return;
@@ -579,7 +592,10 @@ impl GenericPlugin for AudioRecPlugin {
             }) {
             Ok(t) => t,
             Err(e) => {
-                tracing::error!("ワーカースレッドの起動に失敗しました（録音機能は無効）: {}", e);
+                tracing::error!(
+                    "ワーカースレッドの起動に失敗しました（録音機能は無効）: {}",
+                    e
+                );
                 return;
             }
         };
@@ -590,7 +606,10 @@ impl GenericPlugin for AudioRecPlugin {
                 tracing::info!("Named Pipe サーバーを起動しました: {}", PIPE_NAME);
             }
             Err(e) => {
-                tracing::error!("worker_thread Mutex が汚染されています。スレッドを記録できません: {}", e);
+                tracing::error!(
+                    "worker_thread Mutex が汚染されています。スレッドを記録できません: {}",
+                    e
+                );
                 // スレッドは起動済みだが参照を保持できないため、デタッチされる
             }
         }
@@ -635,9 +654,10 @@ impl Drop for AudioRecPlugin {
             }
         };
         if let Some(thread) = thread_opt
-            && thread.join().is_err() {
-                tracing::error!("ワーカースレッドがパニックしました");
-            }
+            && thread.join().is_err()
+        {
+            tracing::error!("ワーカースレッドがパニックしました");
+        }
 
         tracing::info!("プラグインのシャットダウンが完了しました");
     }
@@ -691,9 +711,7 @@ fn pipe_server_loop(
         // ─── パイプインスタンスを作成 ───
         let pipe = create_server_pipe();
         if pipe == INVALID_HANDLE_VALUE {
-            tracing::error!(
-                "Named Pipe インスタンスの作成に失敗しました。サーバーを終了します"
-            );
+            tracing::error!("Named Pipe インスタンスの作成に失敗しました。サーバーを終了します");
             break;
         }
 
@@ -735,11 +753,7 @@ fn pipe_server_loop(
                 let (response, insert_path) = match String::from_utf8(data) {
                     Ok(command) => {
                         tracing::info!("コマンドを受信しました: {}", command.trim());
-                        process_command(
-                            command.trim(),
-                            recorder,
-                            &mut current_recording_path,
-                        )
+                        process_command(command.trim(), recorder, &mut current_recording_path)
                     }
                     Err(e) => {
                         tracing::error!("UTF-8 デコードに失敗しました: {}", e);
@@ -808,14 +822,31 @@ fn process_command(
     recorder: &mut dyn AudioRecorder,
     current_recording_path: &mut Option<PathBuf>,
 ) -> (String, Option<PathBuf>) {
-    if let Some(path_str) = command.strip_prefix("start:") {
+    if let Some(rest) = command.strip_prefix("start:") {
         // ─── start コマンド ───
+        // プロトコル形式: `start:<buffer_frames>:<path>`
+        // buffer_frames が純粋な ASCII 数字列（"0"〜"4294967295"）の場合は
+        // 新形式として解釈する。それ以外（例: ドライブレター `C:` が先頭に来る
+        // 旧形式、または最初のセグメントに非数字文字が含まれるパス）は
+        // buffer_frames=None として扱い、rest 全体をパスとみなす。
+        // Windows のドライブレターは 1 文字の英字であり数字ではないため、
+        // 旧形式の `start:C:\path.wav` は必ず後者に分類される。
+        let (buffer_size, path_str) = match rest.split_once(':') {
+            Some((num_str, path))
+                if !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                let frames = num_str.parse::<u32>().ok().filter(|&n| n > 0);
+                (frames, path)
+            }
+            _ => (None, rest),
+        };
+
         if recorder.is_recording() {
             tracing::info!("既に録音中です（冪等処理）");
             return ("noop:既に録音中です".to_string(), None);
         }
         let path = Path::new(path_str);
-        match recorder.start(path) {
+        match recorder.start(path, buffer_size) {
             Ok(()) => {
                 tracing::info!("録音を開始しました: {}", path_str);
                 *current_recording_path = Some(path.to_path_buf());
@@ -929,7 +960,12 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
 /// * `layer` - レイヤー番号（0始まり）
 /// * `frame` - 開始フレーム番号（0始まり）
 /// * `length_frames` - オブジェクトの長さ（フレーム数）
-fn build_audio_file_alias(file_path: &str, layer: usize, frame: usize, length_frames: usize) -> String {
+fn build_audio_file_alias(
+    file_path: &str,
+    layer: usize,
+    frame: usize,
+    length_frames: usize,
+) -> String {
     let end_frame = frame + length_frames.saturating_sub(1);
     format!(
         "[0]\nlayer={layer}\nframe={frame},{end}\n[0.0]\neffect.name=音声ファイル\nファイル={path}\n",
@@ -1198,7 +1234,7 @@ mod tests {
     }
 
     impl AudioRecorder for MockRecorder {
-        fn start(&mut self, _path: &Path) -> Result<(), String> {
+        fn start(&mut self, _path: &Path, _buffer_size: Option<u32>) -> Result<(), String> {
             if let Some(ref e) = self.start_error {
                 return Err(e.clone());
             }
@@ -1226,7 +1262,20 @@ mod tests {
     fn test_process_command_start_ok() {
         let mut recorder = MockRecorder::new();
         let mut path = None;
-        let (response, insert) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, insert) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path);
+        assert_eq!(response, "ok");
+        assert!(recorder.is_recording());
+        assert!(insert.is_none());
+        assert_eq!(path.as_deref(), Some(Path::new("/tmp/test.wav")));
+    }
+
+    /// `start` コマンドにバッファサイズが含まれる場合も正常に処理されることを確認する。
+    #[test]
+    fn test_process_command_start_ok_with_buffer_size() {
+        let mut recorder = MockRecorder::new();
+        let mut path = None;
+        let (response, insert) =
+            process_command("start:4096:/tmp/test.wav", &mut recorder, &mut path);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
         assert!(insert.is_none());
@@ -1238,7 +1287,7 @@ mod tests {
     fn test_process_command_start_noop_when_recording() {
         let mut recorder = MockRecorder::new().already_recording();
         let mut path = None;
-        let (response, _) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path);
         assert!(response.starts_with("noop:"), "response was: {}", response);
     }
 
@@ -1269,7 +1318,7 @@ mod tests {
     fn test_process_command_start_error() {
         let mut recorder = MockRecorder::new().with_start_error("デバイスエラー");
         let mut path = None;
-        let (response, _) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("デバイスエラー"));
     }
@@ -1302,11 +1351,23 @@ mod tests {
     #[test]
     fn test_build_audio_file_alias() {
         let alias = build_audio_file_alias("C:\\rec\\output.wav", 2, 10, 60);
-        assert!(alias.contains("[0]"), "オブジェクトセクションが必要: {}", alias);
+        assert!(
+            alias.contains("[0]"),
+            "オブジェクトセクションが必要: {}",
+            alias
+        );
         assert!(alias.contains("layer=2"), "レイヤー番号が必要: {}", alias);
         assert!(alias.contains("frame=10,"), "開始フレームが必要: {}", alias);
-        assert!(alias.contains("[0.0]"), "エフェクトセクションが必要: {}", alias);
-        assert!(alias.contains("effect.name=音声ファイル"), "エフェクト名が必要: {}", alias);
+        assert!(
+            alias.contains("[0.0]"),
+            "エフェクトセクションが必要: {}",
+            alias
+        );
+        assert!(
+            alias.contains("effect.name=音声ファイル"),
+            "エフェクト名が必要: {}",
+            alias
+        );
         assert!(
             alias.contains("ファイル=C:\\rec\\output.wav"),
             "ファイルパスが必要: {}",
@@ -1330,7 +1391,11 @@ mod tests {
         let mut recorder = CpalHoundRecorder::new();
         assert!(!recorder.is_recording());
         let result = recorder.stop();
-        assert!(result.is_ok(), "idle 状態での stop は Ok のはず: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "idle 状態での stop は Ok のはず: {:?}",
+            result
+        );
     }
 
     /// `is_recording()` の初期値が `false` であることを確認する。
