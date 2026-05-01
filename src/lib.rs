@@ -825,11 +825,16 @@ fn process_command(
     if let Some(rest) = command.strip_prefix("start:") {
         // ─── start コマンド ───
         // プロトコル形式: `start:<buffer_frames>:<path>`
-        // buffer_frames が純粋な数字列の場合は新形式として解釈する。
-        // それ以外（例: ドライブレター `C:` が先頭に来る旧形式）は
+        // buffer_frames が純粋な ASCII 数字列（"0"〜"4294967295"）の場合は
+        // 新形式として解釈する。それ以外（例: ドライブレター `C:` が先頭に来る
+        // 旧形式、または最初のセグメントに非数字文字が含まれるパス）は
         // buffer_frames=None として扱い、rest 全体をパスとみなす。
+        // Windows のドライブレターは 1 文字の英字であり数字ではないため、
+        // 旧形式の `start:C:\path.wav` は必ず後者に分類される。
         let (buffer_size, path_str) = match rest.split_once(':') {
-            Some((num_str, path)) if num_str.chars().all(|c| c.is_ascii_digit()) => {
+            Some((num_str, path))
+                if !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit()) =>
+            {
                 let frames = num_str.parse::<u32>().ok().filter(|&n| n > 0);
                 (frames, path)
             }
