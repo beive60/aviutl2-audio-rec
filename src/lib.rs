@@ -34,6 +34,8 @@
 //! - レスポンス：`ok` / `noop:<理由>` / `err:<理由>`
 //! - 最大ペイロード長：65,536 バイト
 
+mod timeline_inserter;
+
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -854,7 +856,8 @@ fn process_command(
 /// 録音完了後にオーディオファイルをタイムラインへ挿入する。
 ///
 /// `call_edit_section` を使用してメインスレッド上で処理を実行する。
-/// カーソル位置（フレーム・レイヤー）に `create_object_from_alias` でオブジェクトを生成する。
+/// カーソル位置（フレーム・レイヤー）への挿入を試み、既存オブジェクトと重複する場合は
+/// [`timeline_inserter::insert_at_available_frame`] を通じて挿入可能な位置をロールバック探索する。
 ///
 /// # 引数
 ///
@@ -886,16 +889,47 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
 
         // ─── WAV ファイルの長さをフレーム数に換算 ───
         let length_frames = compute_wav_length_frames(&path, fps);
+        let path_str = path.to_string_lossy().into_owned();
 
-        // ─── エイリアス文字列を構築してオブジェクトを生成 ───
-        let alias = build_audio_file_alias(&path.to_string_lossy(), layer, frame, length_frames);
+        // ─── 挿入可能な位置を探索してオブジェクトを生成 ───
+        // 目標フレームに既存オブジェクトが存在する場合は、
+        // timeline_inserter モジュールが 1 フレームずつ前進しながら
+        // 挿入可能な位置をロールバック探索する。
+        let result = timeline_inserter::insert_at_available_frame(
+            layer,
+            frame,
+            length_frames,
+            |ins_layer, ins_frame, ins_length| {
+                let alias = build_audio_file_alias(&path_str, ins_layer, ins_frame, ins_length);
+                edit_section.create_object_from_alias(&alias, ins_layer, ins_frame, ins_length)
+            },
+        );
 
-        match edit_section.create_object_from_alias(&alias, layer, frame, length_frames) {
-            Ok(handle) => {
-                tracing::info!("タイムラインへの挿入に成功しました: {:?}", handle);
+        match result {
+            timeline_inserter::TimelineInsertResult::Inserted {
+                frame: actual_frame,
+                ..
+            } => {
+                if actual_frame == frame {
+                    tracing::info!(
+                        "タイムラインへの挿入に成功しました: frame={}",
+                        actual_frame
+                    );
+                } else {
+                    tracing::info!(
+                        "タイムラインへの挿入に成功しました（ロールバック先）: \
+                         target_frame={}, actual_frame={}",
+                        frame,
+                        actual_frame
+                    );
+                }
             }
-            Err(e) => {
-                tracing::error!("タイムラインへの挿入に失敗しました: {:?}", e);
+            timeline_inserter::TimelineInsertResult::NotFound => {
+                tracing::warn!(
+                    "挿入可能な位置が見つかりませんでした（{} 回試行）: {}",
+                    timeline_inserter::MAX_INSERT_ATTEMPTS,
+                    path_str
+                );
             }
         }
     }) {
