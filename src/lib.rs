@@ -1262,7 +1262,7 @@ mod tests {
     fn test_process_command_start_ok() {
         let mut recorder = MockRecorder::new();
         let mut path = None;
-        let (response, insert) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, insert) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
         assert!(insert.is_none());

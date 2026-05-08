@@ -672,6 +672,7 @@ mod tests {
     fn test_config_default() {
         let config = Config::default();
         assert!(config.save_path.is_none());
+        assert!(config.buffer_size_frames.is_none());
     }
 
     /// Config の JSON シリアライズ / デシリアライズが正しく動作することを確認する。
@@ -679,10 +680,12 @@ mod tests {
     fn test_config_roundtrip() {
         let config = Config {
             save_path: Some("C:\\録音".to_string()),
+            buffer_size_frames: Some(4096),
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.save_path.as_deref(), Some("C:\\録音"));
+        assert_eq!(restored.buffer_size_frames, Some(4096));
     }
 
     /// 不正な JSON の設定ファイルを `load_config_from_path` がデフォルト値にフォールバックして読み込むことを確認する。
