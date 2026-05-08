@@ -1,15 +1,16 @@
 //! # タイムライン挿入モジュール
 //!
 //! 録音したオーディオファイルをタイムラインに挿入する際、
-//! 目標位置にオブジェクトが存在する場合に挿入可能な位置を再帰的に探索する機能を提供する。
+//! 目標位置にオブジェクトが存在する場合に挿入可能な位置を探索する機能を提供する。
 //!
 //! ## 設計方針
 //!
 //! - **独立モジュール**: このモジュールは AviUtl2 API に依存しない純粋なロジックとして実装する。
 //!   実際の挿入操作はクロージャとして外部から注入し、テスト容易性を確保する。
-//! - **フォールバック戦略**: 目標フレームへの挿入に失敗した場合、1 フレームずつ前進しながら
-//!   挿入可能な位置を再帰的に探索する。これにより、占有オブジェクトの末尾直後に
-//!   自動的にフォールバックする。
+//! - **フォールバック戦略**: 目標フレームへの挿入に失敗した場合、
+//!   `retry_if` が `true` を返すエラーに限り 1 フレームずつ前進しながら
+//!   挿入可能な位置を探索する。これにより、占有オブジェクトの末尾直後に
+//!   自動的にフォールバックできる。
 //! - **有界な試行回数**: 無限ループを防ぐため [`MAX_INSERT_ATTEMPTS`] で試行回数を制限する。
 //!
 //! ## 使用例
@@ -22,13 +23,21 @@
 //!     |ins_layer, ins_frame, ins_length| {
 //!         edit_section.create_object_from_alias(&alias, ins_layer, ins_frame, ins_length)
 //!     },
+//!     |error| {
+//!         let msg = error.to_string().to_ascii_lowercase();
+//!         msg.contains("occupied") || msg.contains("overlap")
+//!     },
 //! );
 //! match result {
 //!     TimelineInsertResult::Inserted { frame, .. } => {
 //!         tracing::info!("フレーム {} に挿入しました", frame);
 //!     }
-//!     TimelineInsertResult::NotFound => {
+//!     TimelineInsertResult::NotFound { last_error } => {
 //!         tracing::warn!("挿入可能な位置が見つかりませんでした");
+//!         tracing::debug!("last_error={:?}", last_error);
+//!     }
+//!     TimelineInsertResult::Failed { frame, error } => {
+//!         tracing::error!("frame {} で再試行不能エラー: {}", frame, error);
 //!     }
 //! }
 //! ```
@@ -46,7 +55,7 @@ const STEP_FRAMES: usize = 1;
 
 /// タイムラインへの挿入結果。
 #[derive(Debug)]
-pub enum TimelineInsertResult<T> {
+pub enum TimelineInsertResult<T, E> {
     /// 挿入成功。
     Inserted {
         /// 実際に挿入した開始フレーム番号。
@@ -55,19 +64,34 @@ pub enum TimelineInsertResult<T> {
         value: T,
     },
     /// 指定した試行回数（[`MAX_INSERT_ATTEMPTS`]）以内に挿入可能な位置が見つからなかった。
-    NotFound,
+    ///
+    /// `last_error` には最後に再試行対象と判定されたエラーを保持する。
+    NotFound {
+        /// 最後に再試行対象と判定されたエラー。
+        last_error: Option<E>,
+    },
+    /// 再試行不能なエラーが発生したため探索を中断した。
+    Failed {
+        /// 失敗したフレーム番号。
+        frame: usize,
+        /// 再試行不能と判定されたエラー。
+        error: E,
+    },
 }
 
 /// タイムラインの指定フレームまたはそれ以降に挿入可能な位置にオブジェクトを挿入する。
 ///
-/// 目標フレームへの挿入に失敗した場合、[`STEP_FRAMES`] ずつ前進しながら再帰的に
-/// 挿入可能な位置を探索する。最大 [`MAX_INSERT_ATTEMPTS`] 回試行して見つからなければ
+/// 目標フレームへの挿入に失敗した場合、`retry_if` が `true` を返すエラーに限り
+/// [`STEP_FRAMES`] ずつ前進しながら反復的に挿入可能な位置を探索する。
+/// 最大 [`MAX_INSERT_ATTEMPTS`] 回試行して見つからなければ
 /// [`TimelineInsertResult::NotFound`] を返す。
 ///
 /// ## フォールバック動作
 ///
 /// `try_insert` が `Err` を返した場合（位置が占有されている等）、
-/// 本関数はフォールバック先として `frame + 1` を次の候補とし、再帰的に試行する。
+/// `retry_if` が `true` を返すとフォールバック先として `frame + 1` を次の候補として試行する。
+/// `retry_if` が `false` を返したエラーは即時に
+/// [`TimelineInsertResult::Failed`] として呼び出し側へ返す。
 /// これにより呼び出し元が手動でリトライロジックを実装する必要がなくなる。
 ///
 /// # 引数
@@ -77,64 +101,49 @@ pub enum TimelineInsertResult<T> {
 /// * `length_frames` - 挿入するオブジェクトの長さ（フレーム数）
 /// * `try_insert` - オブジェクト挿入を試みるクロージャ。
 ///   引数は `(layer, frame, length_frames)` で、成功時は `Ok(T)`、失敗時は `Err(E)` を返す。
-///   このクロージャは複数回呼ばれる可能性があるため `Fn` 境界を要求する。
+/// * `retry_if` - エラーを再試行可能と見なすかを判定するクロージャ。
+///   `true` を返したエラーのみフォールバック探索を継続する。
 ///
 /// # 戻り値
 ///
 /// - 挿入成功時は [`TimelineInsertResult::Inserted`]（実際の挿入フレームと戻り値を含む）
 /// - 試行回数内に挿入可能位置が見つからなかった場合は [`TimelineInsertResult::NotFound`]
-pub fn insert_at_available_frame<T, E, F>(
+/// - 再試行不能なエラー発生時は [`TimelineInsertResult::Failed`]
+pub fn insert_at_available_frame<T, E, F, R>(
     layer: usize,
     start_frame: usize,
     length_frames: usize,
     try_insert: F,
-) -> TimelineInsertResult<T>
+    retry_if: R,
+) -> TimelineInsertResult<T, E>
 where
     F: Fn(usize, usize, usize) -> Result<T, E>,
+    R: Fn(&E) -> bool,
 {
-    insert_recursive(layer, start_frame, length_frames, &try_insert, 0)
-}
+    let mut frame = start_frame;
+    let mut last_error: Option<E> = None;
 
-/// [`insert_at_available_frame`] の内部再帰実装。
-///
-/// `attempt` が [`MAX_INSERT_ATTEMPTS`] に達した時点で探索を終了し、
-/// [`TimelineInsertResult::NotFound`] を返す（有界再帰の保証）。
-///
-/// # 引数
-///
-/// * `layer` - 挿入先レイヤー番号
-/// * `frame` - 今回試みる挿入フレーム番号
-/// * `length_frames` - 挿入するオブジェクトの長さ（フレーム数）
-/// * `try_insert` - 挿入クロージャへの参照
-/// * `attempt` - 現在の試行回数（0 始まり）
-fn insert_recursive<T, E, F>(
-    layer: usize,
-    frame: usize,
-    length_frames: usize,
-    try_insert: &F,
-    attempt: usize,
-) -> TimelineInsertResult<T>
-where
-    F: Fn(usize, usize, usize) -> Result<T, E>,
-{
-    // 試行回数の上限に達した場合は探索を打ち切る
-    if attempt >= MAX_INSERT_ATTEMPTS {
-        return TimelineInsertResult::NotFound;
-    }
-
-    match try_insert(layer, frame, length_frames) {
-        Ok(value) => TimelineInsertResult::Inserted { frame, value },
-        Err(_) => {
-            // 挿入失敗: 1 フレーム前進してフォールバック先を再帰的に探索する
-            match frame.checked_add(STEP_FRAMES) {
-                Some(next_frame) => {
-                    insert_recursive(layer, next_frame, length_frames, try_insert, attempt + 1)
+    for _attempt in 0..MAX_INSERT_ATTEMPTS {
+        match try_insert(layer, frame, length_frames) {
+            Ok(value) => {
+                return TimelineInsertResult::Inserted { frame, value };
+            }
+            Err(error) => {
+                if !retry_if(&error) {
+                    return TimelineInsertResult::Failed { frame, error };
                 }
-                // usize オーバーフロー時は探索を打ち切る
-                None => TimelineInsertResult::NotFound,
+
+                last_error = Some(error);
+                frame = match frame.checked_add(STEP_FRAMES) {
+                    Some(next_frame) => next_frame,
+                    // usize オーバーフロー時は探索を打ち切る
+                    None => return TimelineInsertResult::NotFound { last_error },
+                };
             }
         }
     }
+
+    TimelineInsertResult::NotFound { last_error }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -150,13 +159,14 @@ mod tests {
     fn test_insert_succeeds_at_first_attempt() {
         let result = insert_at_available_frame(0, 100, 60, |_layer, frame, _length| {
             Ok::<usize, String>(frame)
-        });
+        }, |_error| true);
         match result {
             TimelineInsertResult::Inserted { frame, value } => {
                 assert_eq!(frame, 100, "目標フレームで挿入されるはず");
                 assert_eq!(value, 100);
             }
-            TimelineInsertResult::NotFound => panic!("挿入は成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
         }
     }
 
@@ -169,12 +179,13 @@ mod tests {
             } else {
                 Ok(frame)
             }
-        });
+        }, |_error| true);
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(frame, 11, "1 フレーム後に挿入されるはず");
             }
-            TimelineInsertResult::NotFound => panic!("挿入は成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
         }
     }
 
@@ -188,7 +199,7 @@ mod tests {
             } else {
                 Ok(frame)
             }
-        });
+        }, |_error| true);
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(
@@ -197,7 +208,8 @@ mod tests {
                     "占有終了直後のフレームに挿入されるはず"
                 );
             }
-            TimelineInsertResult::NotFound => panic!("挿入は成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
         }
     }
 
@@ -209,11 +221,15 @@ mod tests {
             0,
             60,
             |_layer, _frame, _length| Err::<(), &str>("always occupied"),
+            |_error| true,
         );
-        assert!(
-            matches!(result, TimelineInsertResult::NotFound),
-            "全試行失敗時は NotFound のはず"
-        );
+        match result {
+            TimelineInsertResult::NotFound { last_error } => {
+                assert_eq!(last_error, Some("always occupied"));
+            }
+            TimelineInsertResult::Inserted { .. } => panic!("全試行失敗時は NotFound のはず"),
+            TimelineInsertResult::Failed { .. } => panic!("全試行失敗時は NotFound のはず"),
+        }
     }
 
     /// ちょうど最大試行回数の直前（最後の試行）で成功する場合を確認する。
@@ -229,12 +245,13 @@ mod tests {
             } else {
                 Ok(frame)
             }
-        });
+        }, |_error| true);
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(frame, start + threshold, "最後の試行で成功するはず");
             }
-            TimelineInsertResult::NotFound => panic!("最後の試行で成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("最後の試行で成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("最後の試行で成功するはず"),
         }
     }
 
@@ -252,11 +269,76 @@ mod tests {
             } else {
                 Ok(frame)
             }
-        });
+        }, |_error| true);
         assert!(
-            matches!(result, TimelineInsertResult::NotFound),
+            matches!(result, TimelineInsertResult::NotFound { .. }),
             "MAX_INSERT_ATTEMPTS 回全て失敗した場合は NotFound のはず"
         );
+    }
+
+    /// 再試行不能なエラーは即座に `Failed` を返すことを確認する。
+    #[test]
+    fn test_insert_fails_immediately_on_non_retryable_error() {
+        let result = insert_at_available_frame(
+            0,
+            10,
+            30,
+            |_layer, _frame, _length| Err::<(), &str>("invalid alias"),
+            |error| *error == "occupied",
+        );
+        match result {
+            TimelineInsertResult::Failed { frame, error } => {
+                assert_eq!(frame, 10, "最初のフレームで中断されるはず");
+                assert_eq!(error, "invalid alias");
+            }
+            TimelineInsertResult::Inserted { .. } => panic!("Failed のはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("Failed のはず"),
+        }
+    }
+
+    /// `NotFound` が最後の再試行エラーを保持することを確認する。
+    #[test]
+    fn test_insert_not_found_keeps_last_retryable_error() {
+        let start = 7usize;
+        let result = insert_at_available_frame(
+            0,
+            start,
+            1,
+            |_layer, frame, _length| Err::<(), String>(format!("occupied@{}", frame)),
+            |_error| true,
+        );
+
+        match result {
+            TimelineInsertResult::NotFound { last_error } => {
+                let expected_frame = start + (MAX_INSERT_ATTEMPTS - 1) * STEP_FRAMES;
+                assert_eq!(
+                    last_error,
+                    Some(format!("occupied@{}", expected_frame)),
+                    "最後に試行したフレームのエラーを保持するはず"
+                );
+            }
+            TimelineInsertResult::Inserted { .. } => panic!("NotFound のはず"),
+            TimelineInsertResult::Failed { .. } => panic!("NotFound のはず"),
+        }
+    }
+
+    /// フレーム加算でオーバーフローした場合は `NotFound` で終了することを確認する。
+    #[test]
+    fn test_insert_not_found_when_frame_overflows() {
+        let result = insert_at_available_frame(
+            0,
+            usize::MAX,
+            1,
+            |_layer, _frame, _length| Err::<(), &str>("occupied"),
+            |_error| true,
+        );
+        match result {
+            TimelineInsertResult::NotFound { last_error } => {
+                assert_eq!(last_error, Some("occupied"));
+            }
+            TimelineInsertResult::Inserted { .. } => panic!("NotFound のはず"),
+            TimelineInsertResult::Failed { .. } => panic!("NotFound のはず"),
+        }
     }
 
     /// レイヤー番号がクロージャに正しく渡されることを確認する。
@@ -264,14 +346,15 @@ mod tests {
     fn test_correct_layer_passed_to_closure() {
         let result = insert_at_available_frame(3, 0, 10, |layer, frame, _length| {
             Ok::<(usize, usize), String>((layer, frame))
-        });
+        }, |_error| true);
         match result {
             TimelineInsertResult::Inserted {
                 value: (layer, _), ..
             } => {
                 assert_eq!(layer, 3, "レイヤー番号が正しく渡されるはず");
             }
-            TimelineInsertResult::NotFound => panic!("挿入は成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
         }
     }
 
@@ -284,12 +367,14 @@ mod tests {
             0,
             expected_length,
             |_layer, _frame, length| Ok::<usize, String>(length),
+            |_error| true,
         );
         match result {
             TimelineInsertResult::Inserted { value: length, .. } => {
                 assert_eq!(length, expected_length, "オブジェクト長が正しく渡されるはず");
             }
-            TimelineInsertResult::NotFound => panic!("挿入は成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
         }
     }
 
@@ -298,12 +383,13 @@ mod tests {
     fn test_nonzero_start_frame() {
         let result = insert_at_available_frame(0, 500, 60, |_layer, frame, _length| {
             Ok::<usize, String>(frame)
-        });
+        }, |_error| true);
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(frame, 500, "指定した開始フレームから挿入されるはず");
             }
-            TimelineInsertResult::NotFound => panic!("挿入は成功するはず"),
+            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
+            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
         }
     }
 }
