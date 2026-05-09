@@ -16,7 +16,7 @@
 //! ```
 //!
 //! 1. プラグインロード時にワーカースレッドを起動し、Named Pipe サーバーを常駐させる。
-//! 2. CLI クライアントが `start:<path>` または `stop` コマンドを送信する。
+//! 2. CLI クライアントまたは UI メニューが `start` / `stop` コマンドを送信する。
 //! 3. ワーカースレッドが `CpalHoundRecorder` を介して録音を制御する。
 //! 4. レスポンス（`ok` / `noop:<reason>` / `err:<reason>`）を CLI クライアントに返す。
 //!
@@ -30,10 +30,11 @@
 //!
 //! - 通信方式：Named Pipe（`\\.\pipe\aviutl2_audio_rec`）双方向・メッセージモード
 //! - エンコーディング：UTF-8（null 終端なし、メッセージ長で区切る）
-//! - コマンド：`start:<絶対パス>` または `stop`
+//! - コマンド：`start:<絶対パス>` または `start:<buffer_frames>:<絶対パス>` または `stop`
 //! - レスポンス：`ok` / `noop:<理由>` / `err:<理由>`
 //! - 最大ペイロード長：65,536 バイト
 
+mod shared_config;
 mod timeline_inserter;
 
 use std::io::BufWriter;
@@ -45,17 +46,20 @@ use std::sync::{
 use std::thread::JoinHandle;
 
 use aviutl2::AnyResult;
-use aviutl2::generic::{EditHandle, EditSectionError, GenericPlugin, GenericPluginTable, HostAppHandle};
+use aviutl2::generic::{
+    EditHandle, EditSectionError, GenericPlugin, GenericPluginTable, HostAppHandle,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────
@@ -76,6 +80,12 @@ const PIPE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 
 /// ダミー接続に使用する書き込みアクセス権（`GENERIC_WRITE = 0x40000000`）。
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
+
+/// UI 操作から内部パイプへ接続する際のアクセス権（`GENERIC_READ | GENERIC_WRITE`）。
+const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
+
+/// UI 操作から内部パイプへ接続する際の待機時間（ミリ秒）。
+const UI_PIPE_WAIT_MS: u32 = 5_000;
 
 // ─────────────────────────────────────────────────────────────
 // スレッド間共有ハンドルラッパー
@@ -579,6 +589,14 @@ impl GenericPlugin for AudioRecPlugin {
     fn register(&mut self, registry: &mut HostAppHandle) {
         tracing::info!("プラグインをホストに登録中...");
 
+        // AviUtl2 UI から録音操作できるようにメニューを登録する
+        registry.register_edit_menu("録音開始", || {
+            on_ui_start_recording();
+        });
+        registry.register_edit_menu("録音停止", || {
+            on_ui_stop_recording();
+        });
+
         // 編集ハンドルを取得してワーカースレッドに move する
         let handle = Arc::new(registry.create_edit_handle());
 
@@ -682,6 +700,75 @@ fn init_logging() {
         .event_format(aviutl2::logger::AviUtl2Formatter)
         .with_writer(aviutl2::logger::AviUtl2LogWriter)
         .try_init();
+}
+
+/// UI メニュー「録音開始」が押されたときの処理。
+fn on_ui_start_recording() {
+    let command = match build_ui_start_command() {
+        Ok(command) => command,
+        Err(msg) => {
+            tracing::error!("UI 録音開始コマンドの生成に失敗しました: {}", msg);
+            return;
+        }
+    };
+    dispatch_ui_command(&command);
+}
+
+/// UI メニュー「録音停止」が押されたときの処理。
+fn on_ui_stop_recording() {
+    dispatch_ui_command("stop");
+}
+
+/// UI の録音開始用コマンド（`start:<buffer_frames>:<path>`）を生成する。
+fn build_ui_start_command() -> Result<String, String> {
+    let config = shared_config::load_config();
+    let save_dir = config.save_path.ok_or_else(|| {
+        "保存先が未設定です。CLI で config save-path を設定してください".to_string()
+    })?;
+    let save_dir_path = PathBuf::from(save_dir);
+    if !save_dir_path.is_dir() {
+        return Err(format!(
+            "保存先ディレクトリが存在しません: {}",
+            save_dir_path.display()
+        ));
+    }
+    let filename = format!("{}.wav", local_datetime_string());
+    let output_path = save_dir_path.join(filename);
+    let buffer_frames = config.buffer_size_frames.unwrap_or(0);
+    Ok(format!(
+        "start:{}:{}",
+        buffer_frames,
+        output_path.to_string_lossy()
+    ))
+}
+
+/// 現在のローカル日時を `yyyymmdd-hhmmss` 形式で返す。
+fn local_datetime_string() -> String {
+    let st = unsafe { GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
+
+/// UI から内部パイプ経由でコマンドを送信し、結果をログへ出力する。
+fn dispatch_ui_command(command: &str) {
+    match send_command_and_read_response(command) {
+        Ok(response) => {
+            if response == "ok" {
+                tracing::info!("UI 操作が成功しました: {}", command);
+            } else if let Some(reason) = response.strip_prefix("noop:") {
+                tracing::info!("UI 操作は状態変化なしでした: {}", reason);
+            } else if let Some(reason) = response.strip_prefix("err:") {
+                tracing::error!("UI 操作が失敗しました: {}", reason);
+            } else {
+                tracing::warn!("予期しないレスポンスを受信しました: {}", response);
+            }
+        }
+        Err(msg) => {
+            tracing::error!("UI 操作コマンドの送信に失敗しました: {}", msg);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -800,7 +887,7 @@ fn pipe_server_loop(
 ///
 /// # コマンド形式
 ///
-/// - `start:<絶対パス>` — 指定パスへの録音を開始する
+/// - `start:<絶対パス>` / `start:<buffer_frames>:<絶対パス>` — 指定パスへの録音を開始する
 /// - `stop` — 録音を停止し、録音ファイルをタイムラインに挿入する
 ///
 /// # レスポンス形式
@@ -944,10 +1031,7 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
                 ..
             } => {
                 if actual_frame == frame {
-                    tracing::info!(
-                        "タイムラインへの挿入に成功しました: frame={}",
-                        actual_frame
-                    );
+                    tracing::info!("タイムラインへの挿入に成功しました: frame={}", actual_frame);
                 } else {
                     tracing::info!(
                         "タイムラインへの挿入に成功しました（フォールバック先）: \
@@ -1077,6 +1161,49 @@ fn compute_wav_length_frames(path: &Path, fps: aviutl2::common::Rational32) -> u
             DEFAULT_FRAME_LENGTH // WAV ファイルの読み込みに失敗した場合のデフォルト
         }
     }
+}
+
+/// 内部クライアントとして Named Pipe へコマンドを送信し、レスポンスを受信する。
+fn send_command_and_read_response(command: &str) -> Result<String, String> {
+    let pipe_name_wide: Vec<u16> = PIPE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    let pipe_name = PCWSTR(pipe_name_wide.as_ptr());
+
+    let _ = unsafe { WaitNamedPipeW(pipe_name, UI_PIPE_WAIT_MS) };
+    let handle = unsafe {
+        CreateFileW(
+            pipe_name,
+            GENERIC_READ_WRITE_ACCESS,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|e| format!("内部パイプへの接続に失敗しました: {}", e))?;
+
+    let payload = command.as_bytes();
+    let mut bytes_written: u32 = 0;
+    unsafe { WriteFile(handle, Some(payload), Some(&mut bytes_written), None) }
+        .map_err(|e| format!("内部コマンドの送信に失敗しました: {}", e))?;
+    if bytes_written != payload.len() as u32 {
+        let _ = unsafe { CloseHandle(handle) };
+        return Err(format!(
+            "内部送信バイト数が一致しません: 期待={}, 実際={}",
+            payload.len(),
+            bytes_written
+        ));
+    }
+
+    let mut buf = vec![0u8; MAX_PAYLOAD_BYTES];
+    let mut bytes_read: u32 = 0;
+    let read_result = unsafe { ReadFile(handle, Some(&mut buf), Some(&mut bytes_read), None) };
+    let _ = unsafe { CloseHandle(handle) };
+    read_result.map_err(|e| format!("内部レスポンスの受信に失敗しました: {}", e))?;
+    Ok(String::from_utf8_lossy(&buf[..bytes_read as usize]).into_owned())
 }
 
 /// Named Pipe のサーバーインスタンスを作成する（双方向・メッセージモード）。
@@ -1457,7 +1584,9 @@ mod tests {
     /// `ApiCallFailed` は再試行対象として扱うことを確認する。
     #[test]
     fn test_retryable_timeline_insert_error_api_call_failed() {
-        assert!(is_retryable_timeline_insert_error(&EditSectionError::ApiCallFailed));
+        assert!(is_retryable_timeline_insert_error(
+            &EditSectionError::ApiCallFailed
+        ));
     }
 
     /// 入力値不正（範囲外）は再試行しないことを確認する。

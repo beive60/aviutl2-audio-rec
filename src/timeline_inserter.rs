@@ -157,9 +157,13 @@ mod tests {
     /// 最初の試行で挿入に成功した場合、目標フレームが返ることを確認する。
     #[test]
     fn test_insert_succeeds_at_first_attempt() {
-        let result = insert_at_available_frame(0, 100, 60, |_layer, frame, _length| {
-            Ok::<usize, String>(frame)
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            0,
+            100,
+            60,
+            |_layer, frame, _length| Ok::<usize, String>(frame),
+            |_error| true,
+        );
         match result {
             TimelineInsertResult::Inserted { frame, value } => {
                 assert_eq!(frame, 100, "目標フレームで挿入されるはず");
@@ -173,13 +177,19 @@ mod tests {
     /// 目標フレームが占有されていて、1 フレーム後に挿入できる場合を確認する。
     #[test]
     fn test_insert_succeeds_after_one_skip() {
-        let result = insert_at_available_frame(0, 10, 30, |_layer, frame, _length| {
-            if frame == 10 {
-                Err("occupied")
-            } else {
-                Ok(frame)
-            }
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            0,
+            10,
+            30,
+            |_layer, frame, _length| {
+                if frame == 10 {
+                    Err("occupied")
+                } else {
+                    Ok(frame)
+                }
+            },
+            |_error| true,
+        );
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(frame, 11, "1 フレーム後に挿入されるはず");
@@ -193,13 +203,19 @@ mod tests {
     #[test]
     fn test_insert_succeeds_after_multiple_skips() {
         let occupied_until = 15usize;
-        let result = insert_at_available_frame(0, 10, 30, |_layer, frame, _length| {
-            if frame <= occupied_until {
-                Err("occupied")
-            } else {
-                Ok(frame)
-            }
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            0,
+            10,
+            30,
+            |_layer, frame, _length| {
+                if frame <= occupied_until {
+                    Err("occupied")
+                } else {
+                    Ok(frame)
+                }
+            },
+            |_error| true,
+        );
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(
@@ -239,13 +255,19 @@ mod tests {
         // frame = start_frame + (MAX_INSERT_ATTEMPTS - 1) * STEP_FRAMES で成功する
         let threshold = MAX_INSERT_ATTEMPTS - 1;
         let start = 0usize;
-        let result = insert_at_available_frame(0, start, 1, |_layer, frame, _length| {
-            if frame < start + threshold {
-                Err("occupied")
-            } else {
-                Ok(frame)
-            }
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            0,
+            start,
+            1,
+            |_layer, frame, _length| {
+                if frame < start + threshold {
+                    Err("occupied")
+                } else {
+                    Ok(frame)
+                }
+            },
+            |_error| true,
+        );
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(frame, start + threshold, "最後の試行で成功するはず");
@@ -263,13 +285,19 @@ mod tests {
     fn test_insert_fails_one_past_max_attempts() {
         let threshold = MAX_INSERT_ATTEMPTS; // MAX_INSERT_ATTEMPTS フレーム先まで全て占有
         let start = 0usize;
-        let result = insert_at_available_frame(0, start, 1, |_layer, frame, _length| {
-            if frame < start + threshold {
-                Err("occupied")
-            } else {
-                Ok(frame)
-            }
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            0,
+            start,
+            1,
+            |_layer, frame, _length| {
+                if frame < start + threshold {
+                    Err("occupied")
+                } else {
+                    Ok(frame)
+                }
+            },
+            |_error| true,
+        );
         assert!(
             matches!(result, TimelineInsertResult::NotFound { .. }),
             "MAX_INSERT_ATTEMPTS 回全て失敗した場合は NotFound のはず"
@@ -344,9 +372,13 @@ mod tests {
     /// レイヤー番号がクロージャに正しく渡されることを確認する。
     #[test]
     fn test_correct_layer_passed_to_closure() {
-        let result = insert_at_available_frame(3, 0, 10, |layer, frame, _length| {
-            Ok::<(usize, usize), String>((layer, frame))
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            3,
+            0,
+            10,
+            |layer, frame, _length| Ok::<(usize, usize), String>((layer, frame)),
+            |_error| true,
+        );
         match result {
             TimelineInsertResult::Inserted {
                 value: (layer, _), ..
@@ -371,7 +403,10 @@ mod tests {
         );
         match result {
             TimelineInsertResult::Inserted { value: length, .. } => {
-                assert_eq!(length, expected_length, "オブジェクト長が正しく渡されるはず");
+                assert_eq!(
+                    length, expected_length,
+                    "オブジェクト長が正しく渡されるはず"
+                );
             }
             TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
             TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
@@ -381,9 +416,13 @@ mod tests {
     /// 非ゼロの開始フレームから探索が始まることを確認する。
     #[test]
     fn test_nonzero_start_frame() {
-        let result = insert_at_available_frame(0, 500, 60, |_layer, frame, _length| {
-            Ok::<usize, String>(frame)
-        }, |_error| true);
+        let result = insert_at_available_frame(
+            0,
+            500,
+            60,
+            |_layer, frame, _length| Ok::<usize, String>(frame),
+            |_error| true,
+        );
         match result {
             TimelineInsertResult::Inserted { frame, .. } => {
                 assert_eq!(frame, 500, "指定した開始フレームから挿入されるはず");
