@@ -170,6 +170,12 @@ Issue や Pull Request を歓迎します。[GitHub Issues](https://github.com/b
 
 詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 
+## 実機回帰テスト
+
+個人開発向けの最小実機回帰セットと運用ルールは以下を参照してください。
+
+- [regression/README.md](regression/README.md)
+
 ## ライセンス
 
 [MIT](LICENSE) © 2026 べいぶ

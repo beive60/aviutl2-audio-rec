@@ -4,3 +4,6 @@
 # AviUtl2 CLI
 /.aviutl2-cli
 /release
+
+# VS Code local tasks (contains machine-specific absolute paths)
+/.vscode/tasks.json
