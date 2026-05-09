@@ -817,7 +817,7 @@ fn read_clipboard_unicode_text() -> Result<String, String> {
             let _ = unsafe { CloseClipboard() };
         }
     }
-    let _guard = ClipboardGuard;
+    let _clipboard_guard = ClipboardGuard;
 
     let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }
         .map_err(|e| format!("GetClipboardData が失敗しました: {}", e))?;
@@ -838,7 +838,9 @@ fn read_clipboard_unicode_text() -> Result<String, String> {
     let utf16 = unsafe { std::slice::from_raw_parts(locked, len) };
     let text = String::from_utf16(utf16)
         .map_err(|e| format!("UTF-16 テキストのデコードに失敗しました: {}", e))?;
-    let _ = unsafe { GlobalUnlock(hglobal) };
+    if !unsafe { GlobalUnlock(hglobal) }.as_bool() {
+        tracing::debug!("GlobalUnlock が FALSE を返しました");
+    }
     Ok(text)
 }
 
