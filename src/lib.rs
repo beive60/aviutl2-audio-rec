@@ -55,11 +55,15 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CF_UNICODETEXT, CloseClipboard, GetClipboardData, OpenClipboard,
+};
 use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────
@@ -596,6 +600,27 @@ impl GenericPlugin for AudioRecPlugin {
         registry.register_edit_menu("録音停止", || {
             on_ui_stop_recording();
         });
+        registry.register_edit_menu(
+            "録音設定\\保存先をクリップボードから設定",
+            || {
+                on_ui_set_save_path_from_clipboard();
+            },
+        );
+        registry.register_edit_menu("録音設定\\バッファサイズ\\既定値", || {
+            on_ui_set_buffer_size(None);
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\1024", || {
+            on_ui_set_buffer_size(Some(1024));
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\2048", || {
+            on_ui_set_buffer_size(Some(2048));
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\4096", || {
+            on_ui_set_buffer_size(Some(4096));
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\8192", || {
+            on_ui_set_buffer_size(Some(8192));
+        });
 
         // 編集ハンドルを取得してワーカースレッドに move する
         let handle = Arc::new(registry.create_edit_handle());
@@ -717,6 +742,104 @@ fn on_ui_start_recording() {
 /// UI メニュー「録音停止」が押されたときの処理。
 fn on_ui_stop_recording() {
     dispatch_ui_command("stop");
+}
+
+/// UI メニュー「保存先をクリップボードから設定」が押されたときの処理。
+fn on_ui_set_save_path_from_clipboard() {
+    let text = match read_clipboard_unicode_text() {
+        Ok(text) => text,
+        Err(msg) => {
+            tracing::error!("クリップボードから保存先の取得に失敗しました: {}", msg);
+            return;
+        }
+    };
+
+    let normalized = text.trim().trim_matches('"');
+    if normalized.is_empty() {
+        tracing::error!("クリップボードの内容が空です。保存先を設定できません");
+        return;
+    }
+
+    let save_dir = PathBuf::from(normalized);
+    if !save_dir.is_dir() {
+        tracing::error!(
+            "クリップボードの内容は既存ディレクトリではありません: {}",
+            save_dir.display()
+        );
+        return;
+    }
+
+    let mut config = shared_config::load_config();
+    config.save_path = Some(save_dir.to_string_lossy().into_owned());
+    match shared_config::save_config(&config) {
+        Ok(path) => {
+            tracing::info!(
+                "保存先を更新しました: save_path={}, config={}",
+                save_dir.display(),
+                path.display()
+            );
+        }
+        Err(msg) => {
+            tracing::error!("保存先設定の保存に失敗しました: {}", msg);
+        }
+    }
+}
+
+/// UI メニュー「バッファサイズ設定」が押されたときの処理。
+fn on_ui_set_buffer_size(buffer_size_frames: Option<u32>) {
+    let mut config = shared_config::load_config();
+    config.buffer_size_frames = buffer_size_frames;
+    match shared_config::save_config(&config) {
+        Ok(path) => match buffer_size_frames {
+            Some(frames) => tracing::info!(
+                "録音バッファサイズを更新しました: {} フレーム (config={})",
+                frames,
+                path.display()
+            ),
+            None => tracing::info!(
+                "録音バッファサイズを既定値に戻しました (config={})",
+                path.display()
+            ),
+        },
+        Err(msg) => {
+            tracing::error!("バッファサイズ設定の保存に失敗しました: {}", msg);
+        }
+    }
+}
+
+/// クリップボードの Unicode テキスト（CF_UNICODETEXT）を読み取る。
+fn read_clipboard_unicode_text() -> Result<String, String> {
+    unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard が失敗しました: {}", e))?;
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+    let _guard = ClipboardGuard;
+
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }
+        .map_err(|e| format!("GetClipboardData が失敗しました: {}", e))?;
+    let hglobal = windows::Win32::Foundation::HGLOBAL(handle.0);
+    let locked = unsafe { GlobalLock(hglobal) } as *const u16;
+    if locked.is_null() {
+        return Err("GlobalLock が null を返しました".to_string());
+    }
+
+    let mut len = 0usize;
+    loop {
+        let ch = unsafe { *locked.add(len) };
+        if ch == 0 {
+            break;
+        }
+        len += 1;
+    }
+    let utf16 = unsafe { std::slice::from_raw_parts(locked, len) };
+    let text = String::from_utf16(utf16)
+        .map_err(|e| format!("UTF-16 テキストのデコードに失敗しました: {}", e))?;
+    let _ = unsafe { GlobalUnlock(hglobal) };
+    Ok(text)
 }
 
 /// UI の録音開始用コマンド（`start:<buffer_frames>:<path>`）を生成する。
