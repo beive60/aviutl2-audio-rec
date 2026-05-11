@@ -51,11 +51,10 @@ pub fn load_config_from_path(path: &Path) -> Config {
 /// 共有設定ファイルが存在しない場合のみ、レガシー設定の内容を利用して返す。
 pub fn load_with_legacy_fallback(legacy_path: &Path) -> Config {
     let shared_path = shared_config_path();
-    let shared = load_config_from_path(&shared_path);
-    if shared.save_path.is_some() || shared.buffer_size_frames.is_some() {
-        return shared;
+    if !shared_path.is_file() {
+        return load_config_from_path(legacy_path);
     }
-    load_config_from_path(legacy_path)
+    load_config_from_path(&shared_path)
 }
 
 /// 共有設定ファイルに書き込む。
