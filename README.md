@@ -169,10 +169,10 @@ audio_rec_cli.exe start
 | 項目 | 仕様 |
 | --- | --- |
 | 通信方式 | Named Pipe（`\\.\pipe\aviutl2_audio_rec`） |
-| 方向 | CLI クライアント → プラグイン（単方向） |
+| 方向 | CLI クライアント ↔ プラグイン（双方向） |
 | エンコーディング | UTF-8 |
 | ペイロード | コマンド（`start`/`stop`）。`start` は `start:<buffer_frames>:<path>` 形式もサポート |
-| 最大ペイロード長 | 32,768 バイト |
+| 最大ペイロード長 | 65,536 バイト |
 
 `config save-path` / `config buffer-size` サブコマンドはパイプを使用せず、`%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` を直接更新します。
 

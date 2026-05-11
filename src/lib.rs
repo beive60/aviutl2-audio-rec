@@ -826,6 +826,15 @@ fn read_clipboard_unicode_text() -> Result<String, String> {
     if locked.is_null() {
         return Err("GlobalLock が null を返しました".to_string());
     }
+    struct GlobalUnlockGuard(windows::Win32::Foundation::HGLOBAL);
+    impl Drop for GlobalUnlockGuard {
+        fn drop(&mut self) {
+            if !unsafe { GlobalUnlock(self.0) }.as_bool() {
+                tracing::debug!("GlobalUnlock が FALSE を返しました");
+            }
+        }
+    }
+    let _global_unlock_guard = GlobalUnlockGuard(hglobal);
 
     let mut len = 0usize;
     loop {
@@ -836,12 +845,7 @@ fn read_clipboard_unicode_text() -> Result<String, String> {
         len += 1;
     }
     let utf16 = unsafe { std::slice::from_raw_parts(locked, len) };
-    let text = String::from_utf16(utf16)
-        .map_err(|e| format!("UTF-16 テキストのデコードに失敗しました: {}", e))?;
-    if !unsafe { GlobalUnlock(hglobal) }.as_bool() {
-        tracing::debug!("GlobalUnlock が FALSE を返しました");
-    }
-    Ok(text)
+    String::from_utf16(utf16).map_err(|e| format!("UTF-16 テキストのデコードに失敗しました: {}", e))
 }
 
 /// UI の録音開始用コマンド（`start:<buffer_frames>:<path>`）を生成する。
@@ -878,6 +882,17 @@ fn local_datetime_string() -> String {
 
 /// UI から内部パイプ経由でコマンドを送信し、結果をログへ出力する。
 fn dispatch_ui_command(command: &str) {
+    let command = command.to_string();
+    if let Err(e) = std::thread::Builder::new()
+        .name("aviutl2_audio_rec_ui_cmd".to_string())
+        .spawn(move || dispatch_ui_command_inner(&command))
+    {
+        tracing::error!("UI 操作コマンド処理スレッドの起動に失敗しました: {}", e);
+    }
+}
+
+/// UI から内部パイプ経由でコマンドを送信し、結果をログへ出力する（ワーカ処理本体）。
+fn dispatch_ui_command_inner(command: &str) {
     match send_command_and_read_response(command) {
         Ok(response) => {
             if response == "ok" {
@@ -1290,6 +1305,13 @@ fn compute_wav_length_frames(path: &Path, fps: aviutl2::common::Rational32) -> u
 
 /// 内部クライアントとして Named Pipe へコマンドを送信し、レスポンスを受信する。
 fn send_command_and_read_response(command: &str) -> Result<String, String> {
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
     let pipe_name_wide: Vec<u16> = PIPE_NAME
         .encode_utf16()
         .chain(std::iter::once(0u16))
@@ -1309,13 +1331,13 @@ fn send_command_and_read_response(command: &str) -> Result<String, String> {
         )
     }
     .map_err(|e| format!("内部パイプへの接続に失敗しました: {}", e))?;
+    let handle = HandleGuard(handle);
 
     let payload = command.as_bytes();
     let mut bytes_written: u32 = 0;
-    unsafe { WriteFile(handle, Some(payload), Some(&mut bytes_written), None) }
+    unsafe { WriteFile(handle.0, Some(payload), Some(&mut bytes_written), None) }
         .map_err(|e| format!("内部コマンドの送信に失敗しました: {}", e))?;
     if bytes_written != payload.len() as u32 {
-        let _ = unsafe { CloseHandle(handle) };
         return Err(format!(
             "内部送信バイト数が一致しません: 期待={}, 実際={}",
             payload.len(),
@@ -1325,8 +1347,7 @@ fn send_command_and_read_response(command: &str) -> Result<String, String> {
 
     let mut buf = vec![0u8; MAX_PAYLOAD_BYTES];
     let mut bytes_read: u32 = 0;
-    let read_result = unsafe { ReadFile(handle, Some(&mut buf), Some(&mut bytes_read), None) };
-    let _ = unsafe { CloseHandle(handle) };
+    let read_result = unsafe { ReadFile(handle.0, Some(&mut buf), Some(&mut bytes_read), None) };
     read_result.map_err(|e| format!("内部レスポンスの受信に失敗しました: {}", e))?;
     Ok(String::from_utf8_lossy(&buf[..bytes_read as usize]).into_owned())
 }
