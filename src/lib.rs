@@ -58,6 +58,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_CLASS_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, HANDLE, HINSTANCE, HWND,
     INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -72,10 +73,9 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem,
-    HMENU, IDC_ARROW, LoadCursorW, PostMessageW, RegisterClassW, SetWindowTextW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, HMENU, IDC_ARROW,
+    LoadCursorW, PostMessageW, RegisterClassW, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WNDCLASSW, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{Error as WinError, PCWSTR, w};
 
@@ -104,7 +104,6 @@ const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
 /// UI 操作から内部パイプへ接続する際の待機時間（ミリ秒）。
 const UI_PIPE_WAIT_MS: u32 = 5_000;
 const RECORDING_PANEL_CLASS_NAME: PCWSTR = w!("AviUtl2AudioRecRecordingPanelWindowClass");
-const RECORDING_PANEL_WINDOW_TITLE: PCWSTR = w!("録音パネル");
 const RECORDING_PANEL_WIDTH: i32 = 230;
 const RECORDING_PANEL_HEIGHT: i32 = 130;
 const RECORDING_PANEL_START_BUTTON_ID: u16 = 1001;
@@ -788,10 +787,10 @@ fn register_recording_panel_window(registry: &mut HostAppHandle) -> Result<(), S
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             RECORDING_PANEL_CLASS_NAME,
-            RECORDING_PANEL_WINDOW_TITLE,
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            w!(""),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
             RECORDING_PANEL_WIDTH,
             RECORDING_PANEL_HEIGHT,
             None,
@@ -837,6 +836,7 @@ fn register_recording_panel_window_class() -> Result<(), String> {
         hInstance: hinstance,
         lpszClassName: RECORDING_PANEL_CLASS_NAME,
         hCursor: cursor,
+        hbrBackground: HBRUSH((COLOR_WINDOW.0 as isize + 1) as *mut std::ffi::c_void),
         ..Default::default()
     };
     let atom = unsafe { RegisterClassW(&class) };
