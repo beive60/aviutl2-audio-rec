@@ -788,7 +788,9 @@ fn register_recording_panel_window(registry: &mut HostAppHandle) -> Result<(), S
             WINDOW_EX_STYLE(0),
             RECORDING_PANEL_CLASS_NAME,
             w!(""),
-            WS_CHILD | WS_VISIBLE,
+            // register_window_client 側で WS_CHILD 付与と親設定が行われるため、
+            // ここではトップレベル(非表示)で作成して登録する。
+            WINDOW_STYLE(0),
             0,
             0,
             RECORDING_PANEL_WIDTH,
