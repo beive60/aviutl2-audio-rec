@@ -836,6 +836,7 @@ fn register_recording_panel_window_class() -> Result<(), String> {
         hInstance: hinstance,
         lpszClassName: RECORDING_PANEL_CLASS_NAME,
         hCursor: cursor,
+        // Win32 のクラス背景ブラシは `COLOR_* + 1` を HBRUSH にキャストして指定する規約。
         hbrBackground: HBRUSH((COLOR_WINDOW.0 as isize + 1) as *mut std::ffi::c_void),
         ..Default::default()
     };
