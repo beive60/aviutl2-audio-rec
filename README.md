@@ -95,37 +95,65 @@ audio_rec_cli.exe start # デフォルト保存先 + 自動ファイル名（yyy
 audio_rec_cli.exe stop
 ```
 
-録音中であれば停止、停止中であれば開始します（トグル）。
-
-```sh
-audio_rec_cli.exe toggle "C:\recordings\take1.wav"
-audio_rec_cli.exe toggle  # デフォルト保存先を使用
-```
-
 #### デフォルト保存先の設定
-
-`config save-path` サブコマンドで録音先ディレクトリを保存します。設定は `audio_rec_cli.exe` と同じフォルダの `audio_rec_cli.json` に JSON 形式で永続化されます。
 
 ```sh
 audio_rec_cli.exe config save-path "C:\録音"
 ```
 
-設定後は `start` / `toggle` にパスを渡さなくてもデフォルト保存先と自動生成ファイル名（例: `20260426-001234.wav`）が使用されます。デフォルトが未設定のままパスを省略すると明確なエラーが表示されます。
+#### バッファサイズの設定
+
+```sh
+audio_rec_cli.exe config buffer-size 4096
+audio_rec_cli.exe config buffer-size 0 # デフォルト値に戻す
+```
+
+`config save-path` / `config buffer-size` サブコマンドで設定を保存します。設定は `%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` に JSON 形式で永続化され、CLI とプラグイン UI メニューで共通利用されます。
+
+#### AviUtl2 UI メニューでの操作
+
+AviUtl2 の編集メニューに以下が追加されます。
+
+- `録音開始`
+- `録音停止`
+- `録音設定\保存先をクリップボードから設定`
+- `録音設定\バッファサイズ\既定値 / 1024 / 2048 / 4096 / 8192`
+
+`録音開始` は共有設定の保存先とバッファサイズを使用して録音を開始します。
+保存先が未設定の場合はログにエラーを表示します。保存先を UI から設定する場合は、事前に設定したいディレクトリパスをコピーしてから `録音設定\保存先をクリップボードから設定` を実行してください。
+
+```sh
+例: "C:\録音" をコピーして UI メニューの「保存先をクリップボードから設定」を実行
+```
+
+設定後は `start` にパスを渡さなくてもデフォルト保存先と自動生成ファイル名（例: `20260426-001234.wav`）が使用されます。デフォルトが未設定のままパスを省略すると明確なエラーが表示されます。
 
 成功すると終了コード 0 で終了します。エラー時は標準エラー出力にメッセージが表示され、非ゼロの終了コードで終了します。
 
+#### AviUtl2 録音パネルでの操作
+
+AviUtl2 内のウィンドウクライアントとして `録音パネル` が追加され、以下を常時操作できます。
+
+- 開始ボタン
+- 停止ボタン
+- 録音状態インジケータ（`● 録音中` / `○ 停止中`）
+
+録音パネルの開始/停止ボタンは、編集メニューの `録音開始` / `録音停止` と同じコマンド経路を利用します。
+録音パネルは AviUtl2 内に直接埋め込まれ、独立した別ウィンドウは作成しません。
+
 ### Stream Deck 統合
 
-Stream Deck の「システム: ウェブサイトを開く」または「システム: コマンドの実行」アクションに以下のように設定します。
+Stream Deck の「システム: コマンドの実行」アクションに以下のように設定します。
 
 ```sh
-audio_rec_cli.exe toggle "C:\recordings\take1.wav"
+audio_rec_cli.exe start "C:\recordings\take1.wav"
+audio_rec_cli.exe stop
 ```
 
 デフォルト保存先を設定済みであれば、パスを省略できます。
 
 ```sh
-audio_rec_cli.exe toggle
+audio_rec_cli.exe start
 ```
 
 ## アーキテクチャ
@@ -152,12 +180,12 @@ audio_rec_cli.exe toggle
 | 項目 | 仕様 |
 | --- | --- |
 | 通信方式 | Named Pipe（`\\.\pipe\aviutl2_audio_rec`） |
-| 方向 | CLI クライアント → プラグイン（単方向） |
+| 方向 | CLI クライアント ↔ プラグイン（双方向） |
 | エンコーディング | UTF-8 |
-| ペイロード | コマンド（`start`/`stop`/`toggle`）+ 出力ファイルパス（`start`/`toggle` 時、省略可） |
-| 最大ペイロード長 | 32,768 バイト |
+| ペイロード | コマンド（`start`/`stop`）。`start` は `start:<buffer_frames>:<path>` 形式もサポート |
+| 最大ペイロード長 | 65,536 バイト |
 
-`config save-path` サブコマンドはパイプを使用せず、`audio_rec_cli.json` への書き込みのみをローカルで行います。
+`config save-path` / `config buffer-size` サブコマンドはパイプを使用せず、`%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` を直接更新します。
 
 ## クレジット
 

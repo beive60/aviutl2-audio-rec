@@ -16,7 +16,7 @@
 //! ```
 //!
 //! 1. プラグインロード時にワーカースレッドを起動し、Named Pipe サーバーを常駐させる。
-//! 2. CLI クライアントが `start:<path>` または `stop` コマンドを送信する。
+//! 2. CLI クライアントまたは UI メニューが `start` / `stop` コマンドを送信する。
 //! 3. ワーカースレッドが `CpalHoundRecorder` を介して録音を制御する。
 //! 4. レスポンス（`ok` / `noop:<reason>` / `err:<reason>`）を CLI クライアントに返す。
 //!
@@ -30,32 +30,42 @@
 //!
 //! - 通信方式：Named Pipe（`\\.\pipe\aviutl2_audio_rec`）双方向・メッセージモード
 //! - エンコーディング：UTF-8（null 終端なし、メッセージ長で区切る）
-//! - コマンド：`start:<絶対パス>` または `stop`
+//! - コマンド：`start:<絶対パス>` または `start:<buffer_frames>:<絶対パス>` または `stop`
 //! - レスポンス：`ok` / `noop:<理由>` / `err:<理由>`
 //! - 最大ペイロード長：65,536 バイト
 
+mod shared_config;
 mod timeline_inserter;
 
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
 
 use aviutl2::AnyResult;
-use aviutl2::generic::{EditHandle, EditSectionError, GenericPlugin, GenericPluginTable, HostAppHandle};
+use aviutl2::generic::{
+    EditHandle, EditSectionError, GenericPlugin, GenericPluginTable, HostAppHandle,
+};
+use aviutl2_eframe::{self, egui};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────
@@ -76,6 +86,23 @@ const PIPE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 
 /// ダミー接続に使用する書き込みアクセス権（`GENERIC_WRITE = 0x40000000`）。
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
+
+/// UI 操作から内部パイプへ接続する際のアクセス権（`GENERIC_READ | GENERIC_WRITE`）。
+const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
+
+/// UI 操作から内部パイプへ接続する際の待機時間（ミリ秒）。
+const UI_PIPE_WAIT_MS: u32 = 5_000;
+
+/// 録音状態を保持するグローバルフラグ。
+/// egui パネルと `set_recording_indicator` から共有して参照する。
+static RECORDING_STATE_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// egui コンテキスト。パネルの再描画要求に使用する。
+static PANEL_EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+fn recording_state_flag() -> &'static Arc<AtomicBool> {
+    RECORDING_STATE_FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
 
 // ─────────────────────────────────────────────────────────────
 // スレッド間共有ハンドルラッパー
@@ -543,6 +570,38 @@ pub struct AudioRecPlugin {
     /// `ReadFile` でブロック中の場合は `Some` が設定されており、
     /// `Drop` から `DisconnectNamedPipe` を呼び出して I/O を中断できる。
     active_pipe: Arc<Mutex<Option<SendableHandle>>>,
+
+    /// egui/eframe による録音パネルウィンドウ。
+    /// `Drop` 時に自動的にバックグラウンドスレッドを終了する。
+    panel: aviutl2_eframe::EframeWindow,
+}
+
+unsafe impl Send for AudioRecPlugin {}
+unsafe impl Sync for AudioRecPlugin {}
+
+// ─────────────────────────────────────────────────────────────
+// 録音パネル UI（egui/eframe）
+// ─────────────────────────────────────────────────────────────
+
+/// egui による録音パネルアプリ。
+struct RecordingPanelApp {
+    recording: Arc<AtomicBool>,
+}
+
+impl aviutl2_eframe::eframe::App for RecordingPanelApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut aviutl2_eframe::eframe::Frame) {
+        let is_recording = self.recording.load(Ordering::Relaxed);
+        ui.horizontal(|ui| {
+            if ui.button("開始").clicked() {
+                on_ui_start_recording();
+            }
+            if ui.button("停止").clicked() {
+                on_ui_stop_recording();
+            }
+        });
+        ui.separator();
+        ui.label(if is_recording { "● 録音中" } else { "○ 停止中" });
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -556,10 +615,49 @@ impl GenericPlugin for AudioRecPlugin {
     fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
         init_logging();
         tracing::info!("AviUtl2 マイク録音プラグインを初期化中...");
+
+        let recording = Arc::clone(recording_state_flag());
+        let panel = aviutl2_eframe::EframeWindow::new("AviUtl2AudioRecPanel", move |cc, _handle| {
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.visuals = aviutl2_eframe::aviutl2_visuals();
+            });
+
+            // egui デフォルトフォントは CJK グリフを含まないため、
+            // Windows システムフォントから日本語対応フォントを読み込む。
+            let mut fonts = egui::FontDefinitions::default();
+            let font_candidates = [
+                r"C:\Windows\Fonts\meiryo.ttc",
+                r"C:\Windows\Fonts\YuGothR.ttc",
+                r"C:\Windows\Fonts\msgothic.ttc",
+            ];
+            for path in &font_candidates {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "JapaneseFont".to_owned(),
+                        egui::FontData::from_owned(bytes).into(),
+                    );
+                    if let Some(family) =
+                        fonts.families.get_mut(&egui::FontFamily::Proportional)
+                    {
+                        family.insert(0, "JapaneseFont".to_owned());
+                    }
+                    tracing::debug!("日本語フォントを読み込みました: {}", path);
+                    break;
+                }
+            }
+            cc.egui_ctx.set_fonts(fonts);
+
+            PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
+            let app: Box<dyn aviutl2_eframe::eframe::App> =
+                Box::new(RecordingPanelApp { recording });
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
+        })?;
+
         Ok(Self {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             worker_thread: Mutex::new(None),
             active_pipe: Arc::new(Mutex::new(None)),
+            panel,
         })
     }
 
@@ -578,6 +676,45 @@ impl GenericPlugin for AudioRecPlugin {
     /// プラグインをホストに登録し、ワーカースレッドを起動する。
     fn register(&mut self, registry: &mut HostAppHandle) {
         tracing::info!("プラグインをホストに登録中...");
+
+        // AviUtl2 UI から録音操作できるようにメニューを登録する
+        registry.register_edit_menu("録音開始", || {
+            on_ui_start_recording();
+        });
+        registry.register_edit_menu("録音停止", || {
+            on_ui_stop_recording();
+        });
+        registry.register_edit_menu(
+            "録音設定\\保存先をクリップボードから設定",
+            || {
+                on_ui_set_save_path_from_clipboard();
+            },
+        );
+        registry.register_edit_menu("録音設定\\バッファサイズ\\既定値", || {
+            on_ui_set_buffer_size(None);
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\1024", || {
+            on_ui_set_buffer_size(Some(1024));
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\2048", || {
+            on_ui_set_buffer_size(Some(2048));
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\4096", || {
+            on_ui_set_buffer_size(Some(4096));
+        });
+        registry.register_edit_menu("録音設定\\バッファサイズ\\8192", || {
+            on_ui_set_buffer_size(Some(8192));
+        });
+        match self.panel.handle() {
+            Ok(panel_handle) => {
+                if let Err(e) = registry.register_window_client("録音パネル", &panel_handle) {
+                    tracing::error!("録音パネルの登録に失敗しました: {:?}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("録音パネルのハンドル取得に失敗しました: {:?}", e);
+            }
+        }
 
         // 編集ハンドルを取得してワーカースレッドに move する
         let handle = Arc::new(registry.create_edit_handle());
@@ -682,6 +819,218 @@ fn init_logging() {
         .event_format(aviutl2::logger::AviUtl2Formatter)
         .with_writer(aviutl2::logger::AviUtl2LogWriter)
         .try_init();
+}
+
+fn set_recording_indicator(is_recording: bool) {
+    recording_state_flag().store(is_recording, Ordering::Relaxed);
+    if let Some(ctx) = PANEL_EGUI_CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
+/// UI メニュー「録音開始」が押されたときの処理。
+fn on_ui_start_recording() {
+    let command = match build_ui_start_command() {
+        Ok(command) => command,
+        Err(msg) => {
+            tracing::error!("UI 録音開始コマンドの生成に失敗しました: {}", msg);
+            return;
+        }
+    };
+    dispatch_ui_command_with_kind(&command, UiCommandKind::Start);
+}
+
+/// UI メニュー「録音停止」が押されたときの処理。
+fn on_ui_stop_recording() {
+    dispatch_ui_command_with_kind("stop", UiCommandKind::Stop);
+}
+
+/// UI メニュー「保存先をクリップボードから設定」が押されたときの処理。
+fn on_ui_set_save_path_from_clipboard() {
+    let text = match read_clipboard_unicode_text() {
+        Ok(text) => text,
+        Err(msg) => {
+            tracing::error!("クリップボードから保存先の取得に失敗しました: {}", msg);
+            return;
+        }
+    };
+
+    let normalized = text.trim().trim_matches('"');
+    if normalized.is_empty() {
+        tracing::error!("クリップボードの内容が空です。保存先を設定できません");
+        return;
+    }
+
+    let save_dir = PathBuf::from(normalized);
+    if !save_dir.is_dir() {
+        tracing::error!(
+            "クリップボードの内容は既存ディレクトリではありません: {}",
+            save_dir.display()
+        );
+        return;
+    }
+
+    let mut config = shared_config::load_config();
+    config.save_path = Some(save_dir.to_string_lossy().into_owned());
+    match shared_config::save_config(&config) {
+        Ok(path) => {
+            tracing::info!(
+                "保存先を更新しました: save_path={}, config={}",
+                save_dir.display(),
+                path.display()
+            );
+        }
+        Err(msg) => {
+            tracing::error!("保存先設定の保存に失敗しました: {}", msg);
+        }
+    }
+}
+
+/// UI メニュー「バッファサイズ設定」が押されたときの処理。
+fn on_ui_set_buffer_size(buffer_size_frames: Option<u32>) {
+    let mut config = shared_config::load_config();
+    config.buffer_size_frames = buffer_size_frames;
+    match shared_config::save_config(&config) {
+        Ok(path) => match buffer_size_frames {
+            Some(frames) => tracing::info!(
+                "録音バッファサイズを更新しました: {} フレーム (config={})",
+                frames,
+                path.display()
+            ),
+            None => tracing::info!(
+                "録音バッファサイズを既定値に戻しました (config={})",
+                path.display()
+            ),
+        },
+        Err(msg) => {
+            tracing::error!("バッファサイズ設定の保存に失敗しました: {}", msg);
+        }
+    }
+}
+
+/// クリップボードの Unicode テキスト（CF_UNICODETEXT）を読み取る。
+fn read_clipboard_unicode_text() -> Result<String, String> {
+    unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard が失敗しました: {}", e))?;
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseClipboard() };
+        }
+    }
+    let _clipboard_guard = ClipboardGuard;
+
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }
+        .map_err(|e| format!("GetClipboardData が失敗しました: {}", e))?;
+    let hglobal = windows::Win32::Foundation::HGLOBAL(handle.0);
+    let locked = unsafe { GlobalLock(hglobal) } as *const u16;
+    if locked.is_null() {
+        return Err("GlobalLock が null を返しました".to_string());
+    }
+    struct GlobalUnlockGuard(windows::Win32::Foundation::HGLOBAL);
+    impl Drop for GlobalUnlockGuard {
+        fn drop(&mut self) {
+            if let Err(e) = unsafe { GlobalUnlock(self.0) } {
+                tracing::debug!("GlobalUnlock が失敗しました: {}", e);
+            }
+        }
+    }
+    let _global_unlock_guard = GlobalUnlockGuard(hglobal);
+
+    let mut len = 0usize;
+    loop {
+        let ch = unsafe { *locked.add(len) };
+        if ch == 0 {
+            break;
+        }
+        len += 1;
+    }
+    let utf16 = unsafe { std::slice::from_raw_parts(locked, len) };
+    String::from_utf16(utf16).map_err(|e| format!("UTF-16 テキストのデコードに失敗しました: {}", e))
+}
+
+/// UI の録音開始用コマンド（`start:<buffer_frames>:<path>`）を生成する。
+fn build_ui_start_command() -> Result<String, String> {
+    let config = shared_config::load_config();
+    let save_dir = config.save_path.ok_or_else(|| {
+        "保存先が未設定です。CLI で config save-path を設定してください".to_string()
+    })?;
+    let save_dir_path = PathBuf::from(save_dir);
+    if !save_dir_path.is_dir() {
+        return Err(format!(
+            "保存先ディレクトリが存在しません: {}",
+            save_dir_path.display()
+        ));
+    }
+    let filename = format!("{}.wav", local_datetime_string());
+    let output_path = save_dir_path.join(filename);
+    let buffer_frames = config.buffer_size_frames.unwrap_or(0);
+    Ok(format!(
+        "start:{}:{}",
+        buffer_frames,
+        output_path.to_string_lossy()
+    ))
+}
+
+/// 現在のローカル日時を `yyyymmdd-hhmmss` 形式で返す。
+fn local_datetime_string() -> String {
+    let st = unsafe { GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
+
+#[derive(Clone, Copy)]
+enum UiCommandKind {
+    Start,
+    Stop,
+}
+
+fn dispatch_ui_command_with_kind(command: &str, kind: UiCommandKind) {
+    let command = command.to_string();
+    let state = kind;
+    if let Err(e) = std::thread::Builder::new()
+        .name("aviutl2_audio_rec_ui_cmd".to_string())
+        .spawn(move || dispatch_ui_command_inner(&command, state))
+    {
+        tracing::error!("UI 操作コマンド処理スレッドの起動に失敗しました: {}", e);
+    }
+}
+
+/// UI から内部パイプ経由でコマンドを送信し、結果をログへ出力する（ワーカ処理本体）。
+fn dispatch_ui_command_inner(command: &str, kind: UiCommandKind) {
+    match send_command_and_read_response(command) {
+        Ok(response) => {
+            reflect_recording_state_from_response(kind, &response);
+            if response == "ok" {
+                tracing::info!("UI 操作が成功しました: {}", command);
+            } else if let Some(reason) = response.strip_prefix("noop:") {
+                tracing::info!("UI 操作は状態変化なしでした: {}", reason);
+            } else if let Some(reason) = response.strip_prefix("err:") {
+                tracing::error!("UI 操作が失敗しました: {}", reason);
+            } else {
+                tracing::warn!("予期しないレスポンスを受信しました: {}", response);
+            }
+        }
+        Err(msg) => {
+            tracing::error!("UI 操作コマンドの送信に失敗しました: {}", msg);
+        }
+    }
+}
+
+fn reflect_recording_state_from_response(kind: UiCommandKind, response: &str) {
+    match kind {
+        UiCommandKind::Start if response == "ok" || response.starts_with("noop:") => {
+            // start の noop は「既に録音中」を意味するため、表示状態を録音中へ同期する。
+            set_recording_indicator(true);
+        }
+        UiCommandKind::Stop if response == "ok" || response.starts_with("noop:") => {
+            // stop の noop は「既に停止中」を意味するため、表示状態を停止中へ同期する。
+            set_recording_indicator(false);
+        }
+        _ => {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -800,7 +1149,7 @@ fn pipe_server_loop(
 ///
 /// # コマンド形式
 ///
-/// - `start:<絶対パス>` — 指定パスへの録音を開始する
+/// - `start:<絶対パス>` / `start:<buffer_frames>:<絶対パス>` — 指定パスへの録音を開始する
 /// - `stop` — 録音を停止し、録音ファイルをタイムラインに挿入する
 ///
 /// # レスポンス形式
@@ -944,10 +1293,7 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
                 ..
             } => {
                 if actual_frame == frame {
-                    tracing::info!(
-                        "タイムラインへの挿入に成功しました: frame={}",
-                        actual_frame
-                    );
+                    tracing::info!("タイムラインへの挿入に成功しました: frame={}", actual_frame);
                 } else {
                     tracing::info!(
                         "タイムラインへの挿入に成功しました（フォールバック先）: \
@@ -1077,6 +1423,55 @@ fn compute_wav_length_frames(path: &Path, fps: aviutl2::common::Rational32) -> u
             DEFAULT_FRAME_LENGTH // WAV ファイルの読み込みに失敗した場合のデフォルト
         }
     }
+}
+
+/// 内部クライアントとして Named Pipe へコマンドを送信し、レスポンスを受信する。
+fn send_command_and_read_response(command: &str) -> Result<String, String> {
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let pipe_name_wide: Vec<u16> = PIPE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    let pipe_name = PCWSTR(pipe_name_wide.as_ptr());
+
+    let _ = unsafe { WaitNamedPipeW(pipe_name, UI_PIPE_WAIT_MS) };
+    let handle = unsafe {
+        CreateFileW(
+            pipe_name,
+            GENERIC_READ_WRITE_ACCESS,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|e| format!("内部パイプへの接続に失敗しました: {}", e))?;
+    let handle = HandleGuard(handle);
+
+    let payload = command.as_bytes();
+    let mut bytes_written: u32 = 0;
+    unsafe { WriteFile(handle.0, Some(payload), Some(&mut bytes_written), None) }
+        .map_err(|e| format!("内部コマンドの送信に失敗しました: {}", e))?;
+    if bytes_written != payload.len() as u32 {
+        return Err(format!(
+            "内部送信バイト数が一致しません: 期待={}, 実際={}",
+            payload.len(),
+            bytes_written
+        ));
+    }
+
+    let mut buf = vec![0u8; MAX_PAYLOAD_BYTES];
+    let mut bytes_read: u32 = 0;
+    let read_result = unsafe { ReadFile(handle.0, Some(&mut buf), Some(&mut bytes_read), None) };
+    read_result.map_err(|e| format!("内部レスポンスの受信に失敗しました: {}", e))?;
+    Ok(String::from_utf8_lossy(&buf[..bytes_read as usize]).into_owned())
 }
 
 /// Named Pipe のサーバーインスタンスを作成する（双方向・メッセージモード）。
@@ -1457,7 +1852,9 @@ mod tests {
     /// `ApiCallFailed` は再試行対象として扱うことを確認する。
     #[test]
     fn test_retryable_timeline_insert_error_api_call_failed() {
-        assert!(is_retryable_timeline_insert_error(&EditSectionError::ApiCallFailed));
+        assert!(is_retryable_timeline_insert_error(
+            &EditSectionError::ApiCallFailed
+        ));
     }
 
     /// 入力値不正（範囲外）は再試行しないことを確認する。

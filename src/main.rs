@@ -35,13 +35,13 @@
 //! ### config save-path コマンド
 //!
 //! デフォルトの録音ファイル保存先ディレクトリを設定ファイル（JSON）に保存する。
-//! 設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに置かれる。
+//! 設定ファイルは原則 `%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` に保存される。
 //!
 //! ### config buffer-size コマンド
 //!
 //! cpal 入力ストリームのバッファサイズ（フレーム数）を設定ファイル（JSON）に保存する。
 //! 録音した音声がぷつぷつ途切れる場合は大きな値（例: `4096`）を試すこと。
-//! `0` を指定するとデフォルト値に戻す。設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに置かれる。
+//! `0` を指定するとデフォルト値に戻す。設定ファイルは原則 `%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` に保存される。
 //!
 //! ## エラー処理
 //!
@@ -52,6 +52,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
+
+mod shared_config;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 use windows::Win32::Storage::FileSystem::{
@@ -81,70 +83,13 @@ const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
 /// レスポンスバッファの最大バイト数。
 const MAX_RESPONSE_BYTES: usize = 65_536;
 
-/// 設定ファイル名（`audio_rec_cli.exe` と同一ディレクトリに配置する）。
-const CONFIG_FILE_NAME: &str = "audio_rec_cli.json";
-
-// ─────────────────────────────────────────────────────────────
-// 設定ファイル
-// ─────────────────────────────────────────────────────────────
-
-/// CLI の永続設定。`audio_rec_cli.json` に JSON 形式で保存される。
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Config {
-    /// デフォルトの録音ファイル保存先ディレクトリ。
-    /// 未設定の場合は `None`。
-    save_path: Option<String>,
-    /// cpal 入力ストリームのバッファサイズ（フレーム数）。
-    /// 値が大きいほど音声途切れ（ぷつぷつ）が発生しにくくなる（レイテンシは増加する）。
-    /// 未設定または `0` の場合はデバイスのデフォルト値を使用する。
-    buffer_size_frames: Option<u32>,
-}
-
-/// 設定ファイルのパスを返す。
-///
-/// 設定ファイルは `audio_rec_cli.exe` と同一ディレクトリに配置する。
-/// 実行ファイルのパスが取得できない場合はカレントディレクトリを使用する。
-fn get_config_path() -> PathBuf {
+/// レガシー設定ファイル（旧: `audio_rec_cli.exe` と同一ディレクトリ）パスを返す。
+fn legacy_config_path() -> PathBuf {
     let exe_dir = env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join(CONFIG_FILE_NAME)
-}
-
-/// 設定ファイルを読み込む。
-///
-/// ファイルが存在しない場合やパースに失敗した場合はデフォルト設定を返す。
-fn load_config() -> Config {
-    load_config_from_path(&get_config_path())
-}
-
-/// 指定したパスから設定ファイルを読み込む。
-///
-/// ファイルが存在しない場合やパースに失敗した場合はデフォルト設定を返す。
-fn load_config_from_path(path: &std::path::Path) -> Config {
-    match std::fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Config::default(),
-    }
-}
-
-/// 設定ファイルに書き込む。
-///
-/// # 戻り値
-///
-/// 成功時は `Ok(())`。失敗時はエラーメッセージ。
-fn save_config(config: &Config) -> Result<(), String> {
-    let path = get_config_path();
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("設定のシリアライズに失敗しました: {}", e))?;
-    std::fs::write(&path, content).map_err(|e| {
-        format!(
-            "設定ファイルの書き込みに失敗しました: {} ({})",
-            path.display(),
-            e
-        )
-    })
+    exe_dir.join(shared_config::CONFIG_FILE_NAME)
 }
 
 /// 現在のローカル日時を `yyyymmdd-hhmmss` 形式の文字列として返す。
@@ -203,7 +148,7 @@ fn main() {
             }
 
             // 設定ファイルを読み込む（保存先パスとバッファサイズの両方に使用）
-            let config = load_config();
+            let config = shared_config::load_with_legacy_fallback(&legacy_config_path());
 
             let output_path: String = if args.len() == 3 {
                 args[2].clone()
@@ -286,13 +231,14 @@ fn main() {
                         }
                     }
 
-                    let mut config = load_config();
+                    let mut config =
+                        shared_config::load_with_legacy_fallback(&legacy_config_path());
                     config.save_path = Some(dir.clone());
 
-                    match save_config(&config) {
-                        Ok(()) => {
+                    match shared_config::save_config(&config) {
+                        Ok(path) => {
                             println!("デフォルト保存先を設定しました: {}", dir);
-                            println!("設定ファイル: {}", get_config_path().display());
+                            println!("設定ファイル: {}", path.display());
                         }
                         Err(msg) => {
                             eprintln!("エラー: {}", msg);
@@ -317,13 +263,14 @@ fn main() {
                         }
                     };
 
-                    let mut config = load_config();
+                    let mut config =
+                        shared_config::load_with_legacy_fallback(&legacy_config_path());
                     if frames == 0 {
                         config.buffer_size_frames = None;
-                        match save_config(&config) {
-                            Ok(()) => {
+                        match shared_config::save_config(&config) {
+                            Ok(path) => {
                                 println!("バッファサイズをデフォルトに戻しました。");
-                                println!("設定ファイル: {}", get_config_path().display());
+                                println!("設定ファイル: {}", path.display());
                             }
                             Err(msg) => {
                                 eprintln!("エラー: {}", msg);
@@ -332,10 +279,10 @@ fn main() {
                         }
                     } else {
                         config.buffer_size_frames = Some(frames);
-                        match save_config(&config) {
-                            Ok(()) => {
+                        match shared_config::save_config(&config) {
+                            Ok(path) => {
                                 println!("バッファサイズを {} フレームに設定しました。", frames);
-                                println!("設定ファイル: {}", get_config_path().display());
+                                println!("設定ファイル: {}", path.display());
                             }
                             Err(msg) => {
                                 eprintln!("エラー: {}", msg);
@@ -670,7 +617,7 @@ mod tests {
     /// Config のデフォルト値が正しいことを確認する。
     #[test]
     fn test_config_default() {
-        let config = Config::default();
+        let config = shared_config::Config::default();
         assert!(config.save_path.is_none());
         assert!(config.buffer_size_frames.is_none());
     }
@@ -678,12 +625,12 @@ mod tests {
     /// Config の JSON シリアライズ / デシリアライズが正しく動作することを確認する。
     #[test]
     fn test_config_roundtrip() {
-        let config = Config {
+        let config = shared_config::Config {
             save_path: Some("C:\\録音".to_string()),
             buffer_size_frames: Some(4096),
         };
         let json = serde_json::to_string(&config).unwrap();
-        let restored: Config = serde_json::from_str(&json).unwrap();
+        let restored: shared_config::Config = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.save_path.as_deref(), Some("C:\\録音"));
         assert_eq!(restored.buffer_size_frames, Some(4096));
     }
@@ -698,7 +645,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aviutl2_config_invalid_{unique}.json"));
         std::fs::write(&path, "not json at all").unwrap();
 
-        let config = load_config_from_path(&path);
+        let config = shared_config::load_config_from_path(&path);
         assert!(
             config.save_path.is_none(),
             "不正JSONはデフォルトにフォールバックするはず"
@@ -712,7 +659,7 @@ mod tests {
     fn test_config_missing_file_fallback() {
         let path = std::env::temp_dir().join("aviutl2_config_definitely_not_here_xyzzy.json");
         let _ = std::fs::remove_file(&path); // 念のため削除
-        let config = load_config_from_path(&path);
+        let config = shared_config::load_config_from_path(&path);
         assert!(
             config.save_path.is_none(),
             "ファイル未存在時はデフォルトにフォールバックするはず"
