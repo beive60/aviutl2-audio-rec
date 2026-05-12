@@ -38,7 +38,6 @@ mod shared_config;
 mod timeline_inserter;
 
 use std::io::BufWriter;
-use std::num::NonZeroIsize;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -50,21 +49,16 @@ use aviutl2::AnyResult;
 use aviutl2::generic::{
     EditHandle, EditSectionError, GenericPlugin, GenericPluginTable, HostAppHandle,
 };
-use aviutl2::raw_window_handle::{
-    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
-};
+use aviutl2_eframe::{self, egui};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CLASS_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, HANDLE, HINSTANCE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM,
+    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Pipes::{
@@ -72,12 +66,7 @@ use windows::Win32::System::Pipes::{
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, HMENU, IDC_ARROW,
-    LoadCursorW, PostMessageW, RegisterClassW, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WNDCLASSW, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
-};
-use windows::core::{Error as WinError, PCWSTR, w};
+use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────
 // 定数
@@ -103,40 +92,16 @@ const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
 
 /// UI 操作から内部パイプへ接続する際の待機時間（ミリ秒）。
 const UI_PIPE_WAIT_MS: u32 = 5_000;
-const RECORDING_PANEL_CLASS_NAME: PCWSTR = w!("AviUtl2AudioRecRecordingPanelWindowClass");
-const RECORDING_PANEL_WIDTH: i32 = 230;
-const RECORDING_PANEL_HEIGHT: i32 = 130;
-const RECORDING_PANEL_START_BUTTON_ID: u16 = 1001;
-const RECORDING_PANEL_STOP_BUTTON_ID: u16 = 1002;
-const RECORDING_PANEL_INDICATOR_ID: u16 = 1003;
-const WM_RECORDING_STATE_CHANGED: u32 = WM_APP + 1;
 
-static RECORDING_PANEL_CLASS_READY: OnceLock<Result<(), String>> = OnceLock::new();
-static RECORDING_PANEL_STATE: OnceLock<RecordingPanelState> = OnceLock::new();
+/// 録音状態を保持するグローバルフラグ。
+/// egui パネルと `set_recording_indicator` から共有して参照する。
+static RECORDING_STATE_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-struct RecordingPanelState {
-    hwnd: Mutex<Option<isize>>,
-    recording: AtomicBool,
-}
+/// egui コンテキスト。パネルの再描画要求に使用する。
+static PANEL_EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 
-fn recording_panel_state() -> &'static RecordingPanelState {
-    RECORDING_PANEL_STATE.get_or_init(|| RecordingPanelState {
-        hwnd: Mutex::new(None),
-        recording: AtomicBool::new(false),
-    })
-}
-
-struct RegisteredWindowHandle {
-    hwnd: HWND,
-}
-
-impl HasWindowHandle for RegisteredWindowHandle {
-    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let hwnd = NonZeroIsize::new(self.hwnd.0 as isize).ok_or(HandleError::Unavailable)?;
-        let raw = RawWindowHandle::Win32(Win32WindowHandle::new(hwnd));
-        // SAFETY: self.hwnd は有効な Win32 HWND であり、呼び出し中は借用元が生存している。
-        Ok(unsafe { WindowHandle::borrow_raw(raw) })
-    }
+fn recording_state_flag() -> &'static Arc<AtomicBool> {
+    RECORDING_STATE_FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -605,6 +570,38 @@ pub struct AudioRecPlugin {
     /// `ReadFile` でブロック中の場合は `Some` が設定されており、
     /// `Drop` から `DisconnectNamedPipe` を呼び出して I/O を中断できる。
     active_pipe: Arc<Mutex<Option<SendableHandle>>>,
+
+    /// egui/eframe による録音パネルウィンドウ。
+    /// `Drop` 時に自動的にバックグラウンドスレッドを終了する。
+    panel: aviutl2_eframe::EframeWindow,
+}
+
+unsafe impl Send for AudioRecPlugin {}
+unsafe impl Sync for AudioRecPlugin {}
+
+// ─────────────────────────────────────────────────────────────
+// 録音パネル UI（egui/eframe）
+// ─────────────────────────────────────────────────────────────
+
+/// egui による録音パネルアプリ。
+struct RecordingPanelApp {
+    recording: Arc<AtomicBool>,
+}
+
+impl aviutl2_eframe::eframe::App for RecordingPanelApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut aviutl2_eframe::eframe::Frame) {
+        let is_recording = self.recording.load(Ordering::Relaxed);
+        ui.horizontal(|ui| {
+            if ui.button("開始").clicked() {
+                on_ui_start_recording();
+            }
+            if ui.button("停止").clicked() {
+                on_ui_stop_recording();
+            }
+        });
+        ui.separator();
+        ui.label(if is_recording { "● 録音中" } else { "○ 停止中" });
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -618,10 +615,49 @@ impl GenericPlugin for AudioRecPlugin {
     fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
         init_logging();
         tracing::info!("AviUtl2 マイク録音プラグインを初期化中...");
+
+        let recording = Arc::clone(recording_state_flag());
+        let panel = aviutl2_eframe::EframeWindow::new("AviUtl2AudioRecPanel", move |cc, _handle| {
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.visuals = aviutl2_eframe::aviutl2_visuals();
+            });
+
+            // egui デフォルトフォントは CJK グリフを含まないため、
+            // Windows システムフォントから日本語対応フォントを読み込む。
+            let mut fonts = egui::FontDefinitions::default();
+            let font_candidates = [
+                r"C:\Windows\Fonts\meiryo.ttc",
+                r"C:\Windows\Fonts\YuGothR.ttc",
+                r"C:\Windows\Fonts\msgothic.ttc",
+            ];
+            for path in &font_candidates {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        "JapaneseFont".to_owned(),
+                        egui::FontData::from_owned(bytes).into(),
+                    );
+                    if let Some(family) =
+                        fonts.families.get_mut(&egui::FontFamily::Proportional)
+                    {
+                        family.insert(0, "JapaneseFont".to_owned());
+                    }
+                    tracing::debug!("日本語フォントを読み込みました: {}", path);
+                    break;
+                }
+            }
+            cc.egui_ctx.set_fonts(fonts);
+
+            PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
+            let app: Box<dyn aviutl2_eframe::eframe::App> =
+                Box::new(RecordingPanelApp { recording });
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
+        })?;
+
         Ok(Self {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             worker_thread: Mutex::new(None),
             active_pipe: Arc::new(Mutex::new(None)),
+            panel,
         })
     }
 
@@ -669,8 +705,15 @@ impl GenericPlugin for AudioRecPlugin {
         registry.register_edit_menu("録音設定\\バッファサイズ\\8192", || {
             on_ui_set_buffer_size(Some(8192));
         });
-        if let Err(msg) = register_recording_panel_window(registry) {
-            tracing::error!("録音パネルの登録に失敗しました: {}", msg);
+        match self.panel.handle() {
+            Ok(panel_handle) => {
+                if let Err(e) = registry.register_window_client("録音パネル", &panel_handle) {
+                    tracing::error!("録音パネルの登録に失敗しました: {:?}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("録音パネルのハンドル取得に失敗しました: {:?}", e);
+            }
         }
 
         // 編集ハンドルを取得してワーカースレッドに move する
@@ -720,8 +763,6 @@ impl Drop for AudioRecPlugin {
     /// プラグインのアンロード時にワーカースレッドを安全に終了する。
     fn drop(&mut self) {
         tracing::info!("プラグインをシャットダウン中...");
-
-        destroy_recording_panel_window();
 
         // シャットダウンフラグを設定
         self.shutdown_flag.store(true, Ordering::Relaxed);
@@ -780,236 +821,10 @@ fn init_logging() {
         .try_init();
 }
 
-fn register_recording_panel_window(registry: &mut HostAppHandle) -> Result<(), String> {
-    ensure_recording_panel_window_class()?;
-    let hinstance = current_module_handle()?;
-    let panel_hwnd = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            RECORDING_PANEL_CLASS_NAME,
-            w!(""),
-            // register_window_client 側で WS_CHILD 付与と親設定が行われるため、
-            // ここではトップレベル(非表示)で作成して登録する。
-            WINDOW_STYLE(0),
-            0,
-            0,
-            RECORDING_PANEL_WIDTH,
-            RECORDING_PANEL_HEIGHT,
-            None,
-            None,
-            Some(hinstance),
-            None,
-        )
-    }
-    .map_err(|e| format!("録音パネルウィンドウの作成に失敗しました: {}", e))?;
-
-    let state = recording_panel_state();
-    match state.hwnd.lock() {
-        Ok(mut guard) => {
-            *guard = Some(panel_hwnd.0 as isize);
-        }
-        Err(e) => {
-            e.into_inner().replace(panel_hwnd.0 as isize);
-        }
-    }
-    state.recording.store(false, Ordering::Relaxed);
-    update_recording_indicator_label(panel_hwnd, false);
-
-    let window = RegisteredWindowHandle { hwnd: panel_hwnd };
-    registry
-        .register_window_client("録音パネル", &window)
-        .map_err(|e| format!("録音パネルの登録に失敗しました: {}", e))?;
-    Ok(())
-}
-
-fn ensure_recording_panel_window_class() -> Result<(), String> {
-    RECORDING_PANEL_CLASS_READY
-        .get_or_init(register_recording_panel_window_class)
-        .clone()
-}
-
-fn register_recording_panel_window_class() -> Result<(), String> {
-    let hinstance = current_module_handle()?;
-    let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }
-        .ok()
-        .unwrap_or_default();
-    let class = WNDCLASSW {
-        lpfnWndProc: Some(recording_panel_wnd_proc),
-        hInstance: hinstance,
-        lpszClassName: RECORDING_PANEL_CLASS_NAME,
-        hCursor: cursor,
-        // Win32 のクラス背景ブラシは `COLOR_* + 1` を HBRUSH にキャストして指定する規約。
-        hbrBackground: HBRUSH((COLOR_WINDOW.0 as isize + 1) as *mut std::ffi::c_void),
-        ..Default::default()
-    };
-    let atom = unsafe { RegisterClassW(&class) };
-    if atom == 0 {
-        let err = WinError::from_win32();
-        if err.code() != ERROR_CLASS_ALREADY_EXISTS.to_hresult() {
-            return Err(format!(
-                "録音パネルウィンドウクラス登録に失敗しました: {}",
-                err
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn current_module_handle() -> Result<HINSTANCE, String> {
-    unsafe { GetModuleHandleW(None) }
-        .map(|hmodule| HINSTANCE(hmodule.0))
-        .map_err(|e| format!("モジュールハンドルの取得に失敗しました: {}", e))
-}
-
-unsafe extern "system" fn recording_panel_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_CREATE => {
-            create_recording_panel_controls(hwnd);
-            let is_recording = recording_panel_state().recording.load(Ordering::Relaxed);
-            update_recording_indicator_label(hwnd, is_recording);
-            LRESULT(0)
-        }
-        WM_COMMAND => {
-            let command_id = (wparam.0 & 0xFFFF) as u16;
-            if command_id == RECORDING_PANEL_START_BUTTON_ID {
-                on_ui_start_recording();
-                return LRESULT(0);
-            }
-            if command_id == RECORDING_PANEL_STOP_BUTTON_ID {
-                on_ui_stop_recording();
-                return LRESULT(0);
-            }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-        WM_RECORDING_STATE_CHANGED => {
-            update_recording_indicator_label(hwnd, wparam.0 != 0);
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            match recording_panel_state().hwnd.lock() {
-                Ok(mut guard) => {
-                    *guard = None;
-                }
-                Err(e) => {
-                    e.into_inner().take();
-                }
-            }
-            LRESULT(0)
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-    }
-}
-
-fn create_recording_panel_controls(hwnd: HWND) {
-    let _ = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("BUTTON"),
-            w!("開始"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            12,
-            12,
-            90,
-            28,
-            Some(hwnd),
-            Some(HMENU(
-                RECORDING_PANEL_START_BUTTON_ID as usize as *mut std::ffi::c_void,
-            )),
-            current_module_handle().ok(),
-            None,
-        )
-    };
-    let _ = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("BUTTON"),
-            w!("停止"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            112,
-            12,
-            90,
-            28,
-            Some(hwnd),
-            Some(HMENU(
-                RECORDING_PANEL_STOP_BUTTON_ID as usize as *mut std::ffi::c_void,
-            )),
-            current_module_handle().ok(),
-            None,
-        )
-    };
-    let _ = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("STATIC"),
-            w!("○ 停止中"),
-            WS_CHILD | WS_VISIBLE,
-            12,
-            56,
-            190,
-            24,
-            Some(hwnd),
-            Some(HMENU(
-                RECORDING_PANEL_INDICATOR_ID as usize as *mut std::ffi::c_void,
-            )),
-            current_module_handle().ok(),
-            None,
-        )
-    };
-}
-
-fn update_recording_indicator_label(hwnd: HWND, is_recording: bool) {
-    let indicator = match unsafe { GetDlgItem(Some(hwnd), RECORDING_PANEL_INDICATOR_ID as i32) } {
-        Ok(indicator) => indicator,
-        Err(_) => return,
-    };
-    if indicator.0.is_null() {
-        return;
-    }
-    let text = if is_recording {
-        w!("● 録音中")
-    } else {
-        w!("○ 停止中")
-    };
-    let _ = unsafe { SetWindowTextW(indicator, text) };
-}
-
 fn set_recording_indicator(is_recording: bool) {
-    let state = recording_panel_state();
-    state.recording.store(is_recording, Ordering::Relaxed);
-
-    let panel_hwnd = match state.hwnd.lock() {
-        Ok(guard) => guard.map(|hwnd| HWND(hwnd as *mut std::ffi::c_void)),
-        Err(e) => e
-            .into_inner()
-            .map(|hwnd| HWND(hwnd as *mut std::ffi::c_void)),
-    };
-    if let Some(hwnd) = panel_hwnd {
-        let _ = unsafe {
-            PostMessageW(
-                Some(hwnd),
-                WM_RECORDING_STATE_CHANGED,
-                WPARAM(is_recording as usize),
-                LPARAM(0),
-            )
-        };
-    }
-}
-
-fn destroy_recording_panel_window() {
-    let panel_hwnd = match recording_panel_state().hwnd.lock() {
-        Ok(mut guard) => guard.take().map(|hwnd| HWND(hwnd as *mut std::ffi::c_void)),
-        Err(e) => e
-            .into_inner()
-            .take()
-            .map(|hwnd| HWND(hwnd as *mut std::ffi::c_void)),
-    };
-    if let Some(hwnd) = panel_hwnd {
-        let _ = unsafe { DestroyWindow(hwnd) };
+    recording_state_flag().store(is_recording, Ordering::Relaxed);
+    if let Some(ctx) = PANEL_EGUI_CTX.get() {
+        ctx.request_repaint();
     }
 }
 
