@@ -61,9 +61,8 @@ use windows::Win32::System::Pipes::{
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CF_UNICODETEXT, CloseClipboard, GetClipboardData, OpenClipboard,
-};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────
@@ -829,8 +828,8 @@ fn read_clipboard_unicode_text() -> Result<String, String> {
     struct GlobalUnlockGuard(windows::Win32::Foundation::HGLOBAL);
     impl Drop for GlobalUnlockGuard {
         fn drop(&mut self) {
-            if !unsafe { GlobalUnlock(self.0) }.as_bool() {
-                tracing::debug!("GlobalUnlock が FALSE を返しました");
+            if let Err(e) = unsafe { GlobalUnlock(self.0) } {
+                tracing::debug!("GlobalUnlock が失敗しました: {}", e);
             }
         }
     }
