@@ -622,30 +622,10 @@ impl GenericPlugin for AudioRecPlugin {
                 style.visuals = aviutl2_eframe::aviutl2_visuals();
             });
 
-            // egui デフォルトフォントは CJK グリフを含まないため、
-            // Windows システムフォントから日本語対応フォントを読み込む。
-            let mut fonts = egui::FontDefinitions::default();
-            let font_candidates = [
-                r"C:\Windows\Fonts\meiryo.ttc",
-                r"C:\Windows\Fonts\YuGothR.ttc",
-                r"C:\Windows\Fonts\msgothic.ttc",
-            ];
-            for path in &font_candidates {
-                if let Ok(bytes) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "JapaneseFont".to_owned(),
-                        egui::FontData::from_owned(bytes).into(),
-                    );
-                    if let Some(family) =
-                        fonts.families.get_mut(&egui::FontFamily::Proportional)
-                    {
-                        family.insert(0, "JapaneseFont".to_owned());
-                    }
-                    tracing::debug!("日本語フォントを読み込みました: {}", path);
-                    break;
-                }
-            }
-            cc.egui_ctx.set_fonts(fonts);
+            // AviUtl2 が設定しているフォントを egui に適用する。
+            // aviutl2_eframe::aviutl2_fonts() は fontdb でシステムフォントを検索し、
+            // AviUtl2 の Control / EditControl 設定フォントを読み込む。
+            cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
 
             PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
             let app: Box<dyn aviutl2_eframe::eframe::App> =

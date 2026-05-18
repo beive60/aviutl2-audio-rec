@@ -15,6 +15,7 @@ cargo_build_release = ["cargo build --release"]
 
 [artifacts.plugin]
 destination = "Plugin/aviutl2_audio_rec.aux2"
+placement_method = "copy"
 
 [artifacts.plugin.profiles.debug]
 build = { group = "cargo_build_debug" }
@@ -26,6 +27,7 @@ source = "target/release/aviutl2_audio_rec.dll"
 
 [artifacts.cli]
 destination = "audio_rec_cli.exe"
+placement_method = "copy"
 
 [artifacts.cli.profiles.debug]
 build = { group = "cargo_build_debug" }

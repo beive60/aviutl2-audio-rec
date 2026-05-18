@@ -15,15 +15,15 @@ path = "src/main.rs"
 
 [dependencies]
 # AviUtl2 SDK の Rust バインディング（汎用プラグイン API を使用）
-aviutl2 = "0.23"
+aviutl2 = "0.29"
 # AviUtl2 向け egui/eframe ウィンドウユーティリティ
-aviutl2-eframe = "0.23"
+aviutl2-eframe = "0.29"
 # クロスプラットフォーム オーディオキャプチャ（WASAPI バックエンド）
 cpal = "0.15"
 # WAV ファイルエンコード
 hound = "3"
 # Windows API バインディング（Named Pipe / ファイル I/O）
-windows = { version = "0.59", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_IO",
