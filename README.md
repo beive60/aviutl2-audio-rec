@@ -1,6 +1,6 @@
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-AviUtl2（ExEdit2）のタイムラインを再生しながら、ワンボタンでマイク音声を録音し WAV ファイルとして保存する Rust 製プラグインと CLI クライアント。
+、ワンボタンでマイク音声を録音しWAV ファイルとして保存し、AviUtl2（ExEdit2）のタイムラインを挿入する Rust 製プラグインと CLI クライアント。
 
 AviUtl2 の汎用プラグイン（`.aux2`）が Named Pipe サーバーとして常駐し、CLI クライアントからの録音コマンドを受け取って Windows WASAPI 経由で録音セッションを制御します。Stream Input のプロファイルと組み合わせることで、コントローラーの1ボタン操作で録音の開始・停止ができます。録音停止後は収録した WAV ファイルがタイムラインのカーソル位置に自動挿入されます。
 
@@ -112,7 +112,7 @@ audio_rec_cli.exe config buffer-size 0 # デフォルト値に戻す
 
 #### AviUtl2 UI メニューでの操作
 
-AviUtl2 の編集メニューに以下が追加されます。
+AviUtl2 の編集メニュー > プラグインに以下が追加されます。
 
 - `録音開始`
 - `録音停止`
