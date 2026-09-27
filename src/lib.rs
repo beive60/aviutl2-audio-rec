@@ -601,6 +601,10 @@ impl aviutl2_eframe::eframe::App for RecordingPanelApp {
         });
         ui.separator();
         ui.label(if is_recording { "● 録音中" } else { "○ 停止中" });
+        ui.separator();
+        if ui.button("保存先を選択...").clicked() {
+            on_ui_choose_save_path();
+        }
     }
 }
 
@@ -664,6 +668,12 @@ impl GenericPlugin for AudioRecPlugin {
         registry.register_edit_menu("録音停止", || {
             on_ui_stop_recording();
         });
+        registry.register_edit_menu(
+            "録音設定\\保存先を選択...",
+            || {
+                on_ui_choose_save_path();
+            },
+        );
         registry.register_edit_menu(
             "録音設定\\保存先をクリップボードから設定",
             || {
@@ -825,6 +835,57 @@ fn on_ui_stop_recording() {
     dispatch_ui_command_with_kind("stop", UiCommandKind::Stop);
 }
 
+/// 録音ファイルの保存先ディレクトリを永続設定へ保存する。
+fn save_recording_directory(save_dir: &Path) -> Result<PathBuf, String> {
+    if !save_dir.is_dir() {
+        return Err(format!(
+            "指定した保存先ディレクトリが存在しません: {}",
+            save_dir.display()
+        ));
+    }
+
+    let mut config = shared_config::load_config();
+    config.save_path = Some(save_dir.to_string_lossy().into_owned());
+
+    shared_config::save_config(&config)
+}
+
+/// ネイティブのフォルダー選択ダイアログから録音保存先を設定する。
+fn on_ui_choose_save_path() {
+    let config = shared_config::load_config();
+
+    let mut dialog =
+        rfd::FileDialog::new().set_title("録音ファイルの保存先を選択");
+
+    // 既に有効な保存先が設定されていれば、そこからダイアログを開く。
+    if let Some(current) = config.save_path.as_deref() {
+        let current_path = PathBuf::from(current);
+
+        if current_path.is_dir() {
+            dialog = dialog.set_directory(&current_path);
+        }
+    }
+
+    // キャンセル時は何もしない。
+    let Some(save_dir) = dialog.pick_folder() else {
+        tracing::debug!("保存先フォルダーの選択をキャンセルしました");
+        return;
+    };
+
+    match save_recording_directory(&save_dir) {
+        Ok(config_path) => {
+            tracing::info!(
+                "保存先を更新しました: save_path={}, config={}",
+                save_dir.display(),
+                config_path.display()
+            );
+        }
+        Err(msg) => {
+            tracing::error!("保存先設定の保存に失敗しました: {}", msg);
+        }
+    }
+}
+
 /// UI メニュー「保存先をクリップボードから設定」が押されたときの処理。
 fn on_ui_set_save_path_from_clipboard() {
     let text = match read_clipboard_unicode_text() {
@@ -842,22 +903,13 @@ fn on_ui_set_save_path_from_clipboard() {
     }
 
     let save_dir = PathBuf::from(normalized);
-    if !save_dir.is_dir() {
-        tracing::error!(
-            "クリップボードの内容は既存ディレクトリではありません: {}",
-            save_dir.display()
-        );
-        return;
-    }
 
-    let mut config = shared_config::load_config();
-    config.save_path = Some(save_dir.to_string_lossy().into_owned());
-    match shared_config::save_config(&config) {
-        Ok(path) => {
+    match save_recording_directory(&save_dir) {
+        Ok(config_path) => {
             tracing::info!(
                 "保存先を更新しました: save_path={}, config={}",
                 save_dir.display(),
-                path.display()
+                config_path.display()
             );
         }
         Err(msg) => {
@@ -933,7 +985,7 @@ fn read_clipboard_unicode_text() -> Result<String, String> {
 fn build_ui_start_command() -> Result<String, String> {
     let config = shared_config::load_config();
     let save_dir = config.save_path.ok_or_else(|| {
-        "保存先が未設定です。CLI で config save-path を設定してください".to_string()
+        "保存先が未設定です。録音パネルまたは録音設定メニューから保存先を設定してください".to_string()
     })?;
     let save_dir_path = PathBuf::from(save_dir);
     if !save_dir_path.is_dir() {
