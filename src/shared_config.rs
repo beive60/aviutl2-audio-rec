@@ -8,13 +8,45 @@ use std::path::{Path, PathBuf};
 /// 共有設定ファイル名。
 pub const CONFIG_FILE_NAME: &str = "audio_rec_cli.json";
 
+/// 先頭無音トリムの既定値。
+pub const DEFAULT_TRIM_THRESHOLD_DBFS: f64 = -45.0;
+pub const DEFAULT_TRIM_HOLD_MS: u32 = 30;
+pub const DEFAULT_TRIM_PREROLL_MS: u32 = 80;
+
 /// CLI とプラグインで共通利用する永続設定。
-#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(default)]
 pub struct Config {
     /// デフォルトの録音ファイル保存先ディレクトリ。
     pub save_path: Option<String>,
+
     /// cpal 入力ストリームのバッファサイズ（フレーム数）。
     pub buffer_size_frames: Option<u32>,
+
+    /// 録音終了時に先頭無音を自動トリムする。
+    pub trim_leading_silence: bool,
+
+    /// 発声開始とみなすRMS閾値（dBFS）。
+    pub trim_threshold_dbfs: f64,
+
+    /// 閾値超過が継続する必要がある時間（ms）。
+    pub trim_hold_ms: u32,
+
+    /// 発声検出位置より前に残す時間（ms）。
+    pub trim_preroll_ms: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            save_path: None,
+            buffer_size_frames: None,
+            trim_leading_silence: true,
+            trim_threshold_dbfs: DEFAULT_TRIM_THRESHOLD_DBFS,
+            trim_hold_ms: DEFAULT_TRIM_HOLD_MS,
+            trim_preroll_ms: DEFAULT_TRIM_PREROLL_MS,
+        }
+    }
 }
 
 /// 共通設定ファイルのパスを返す。
