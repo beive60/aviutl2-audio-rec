@@ -842,7 +842,7 @@ fn on_ui_set_save_path_from_clipboard() {
     }
 
     let save_dir = PathBuf::from(normalized);
-    if !save_dir.is_dir() {
+    if save_dir.is_absolute() && !save_dir.is_dir() {
         tracing::error!(
             "クリップボードの内容は既存ディレクトリではありません: {}",
             save_dir.display()
@@ -936,7 +936,8 @@ fn build_ui_start_command() -> Result<String, String> {
         "保存先が未設定です。CLI で config save-path を設定してください".to_string()
     })?;
     let save_dir_path = PathBuf::from(save_dir);
-    if !save_dir_path.is_dir() {
+
+    if save_dir_path.is_absolute() && !save_dir_path.is_dir() {
         return Err(format!(
             "保存先ディレクトリが存在しません: {}",
             save_dir_path.display()
@@ -1013,6 +1014,70 @@ fn reflect_recording_state_from_response(kind: UiCommandKind, response: &str) {
     }
 }
 
+/// 現在のAviUtl2プロジェクトファイルが存在するディレクトリを取得する。
+///
+/// プロジェクトが未保存の場合は `Ok(None)` を返す。
+fn get_current_project_dir(
+    edit_handle: &Arc<EditHandle>,
+) -> Result<Option<PathBuf>, String> {
+    if !edit_handle.is_ready() {
+        return Ok(None);
+    }
+
+    let handle_for_callback = Arc::clone(edit_handle);
+
+    let project_path = edit_handle
+        .call_edit_section(move |edit_section| {
+            let project_file =
+                edit_section.get_project_file(&handle_for_callback);
+
+            project_file.get_path()
+        })
+        .map_err(|e| {
+            format!(
+                "プロジェクトファイルパスの取得に失敗しました: {:?}",
+                e
+            )
+        })?;
+
+    Ok(project_path.and_then(|path| {
+        path.parent().map(Path::to_path_buf)
+    }))
+}
+
+/// 録音先パスを実際のファイルシステム上のパスへ解決する。
+///
+/// 絶対パスはそのまま使用する。
+/// 相対パスは現在のプロジェクトディレクトリを基準に解決する。
+fn resolve_recording_path(
+    path: &Path,
+    project_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let project_dir = project_dir.ok_or_else(|| {
+        "相対保存先を使用するには、先にプロジェクトを保存してください"
+            .to_string()
+    })?;
+
+    let resolved = project_dir.join(path);
+
+    // 相対保存先のディレクトリは自動作成する。
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "録音先ディレクトリの作成に失敗しました: {} ({})",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(resolved)
+}
+
 // ─────────────────────────────────────────────────────────────
 // Named Pipe サーバーループ
 // ─────────────────────────────────────────────────────────────
@@ -1084,7 +1149,25 @@ fn pipe_server_loop(
                 let (response, insert_path) = match String::from_utf8(data) {
                     Ok(command) => {
                         tracing::info!("コマンドを受信しました: {}", command.trim());
-                        process_command(command.trim(), recorder, &mut current_recording_path)
+
+                        let command = command.trim();
+
+                        let project_dir = if command.starts_with("start:") {
+                            match get_current_project_dir(&edit_handle) {
+                                Ok(dir) => dir,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "プロジェクトディレクトリを取得できませんでした: {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        process_command(command.trim(), recorder, &mut current_recording_path, project_dir.as_deref())
                     }
                     Err(e) => {
                         tracing::error!("UTF-8 デコードに失敗しました: {}", e);
@@ -1152,6 +1235,7 @@ fn process_command(
     command: &str,
     recorder: &mut dyn AudioRecorder,
     current_recording_path: &mut Option<PathBuf>,
+    project_dir: Option<&Path>,
 ) -> (String, Option<PathBuf>) {
     if let Some(rest) = command.strip_prefix("start:") {
         // ─── start コマンド ───
@@ -1176,15 +1260,41 @@ fn process_command(
             tracing::info!("既に録音中です（冪等処理）");
             return ("noop:既に録音中です".to_string(), None);
         }
-        let path = Path::new(path_str);
-        match recorder.start(path, buffer_size) {
+        let raw_path = Path::new(path_str);
+        let path = match resolve_recording_path(
+            raw_path,
+            project_dir,
+        ) {
+            Ok(path) => path,
+
+            Err(e) => {
+                tracing::error!(
+                    "録音先パスの解決に失敗しました: {}",
+                    e
+                );
+
+                return (format!("err:{}", e), None);
+            }
+        };
+
+        match recorder.start(&path, buffer_size) {
             Ok(()) => {
-                tracing::info!("録音を開始しました: {}", path_str);
-                *current_recording_path = Some(path.to_path_buf());
+                tracing::info!(
+                    "録音を開始しました: {}",
+                    path.display()
+                );
+
+                *current_recording_path = Some(path);
+
                 ("ok".to_string(), None)
             }
+
             Err(e) => {
-                tracing::error!("録音の開始に失敗しました: {}", e);
+                tracing::error!(
+                    "録音の開始に失敗しました: {}",
+                    e
+                );
+
                 (format!("err:{}", e), None)
             }
         }
@@ -1706,7 +1816,7 @@ mod tests {
     fn test_process_command_start_ok() {
         let mut recorder = MockRecorder::new();
         let mut path = None;
-        let (response, insert) = process_command("start:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, insert) = process_command("start:/tmp/test.wav", &mut recorder, &mut path, None);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
         assert!(insert.is_none());
@@ -1719,7 +1829,7 @@ mod tests {
         let mut recorder = MockRecorder::new();
         let mut path = None;
         let (response, insert) =
-            process_command("start:4096:/tmp/test.wav", &mut recorder, &mut path);
+            process_command("start:4096:/tmp/test.wav", &mut recorder, &mut path, None);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
         assert!(insert.is_none());
@@ -1731,7 +1841,7 @@ mod tests {
     fn test_process_command_start_noop_when_recording() {
         let mut recorder = MockRecorder::new().already_recording();
         let mut path = None;
-        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path, None);
         assert!(response.starts_with("noop:"), "response was: {}", response);
     }
 
@@ -1740,7 +1850,7 @@ mod tests {
     fn test_process_command_stop_ok() {
         let mut recorder = MockRecorder::new().already_recording();
         let mut current = Some(PathBuf::from("/tmp/test.wav"));
-        let (response, insert) = process_command("stop", &mut recorder, &mut current);
+        let (response, insert) = process_command("stop", &mut recorder, &mut current, None);
         assert_eq!(response, "ok");
         assert!(!recorder.is_recording());
         // stop 後は挿入パスが返され、current_path はクリアされる
@@ -1753,7 +1863,7 @@ mod tests {
     fn test_process_command_stop_noop_when_idle() {
         let mut recorder = MockRecorder::new();
         let mut path = None;
-        let (response, _) = process_command("stop", &mut recorder, &mut path);
+        let (response, _) = process_command("stop", &mut recorder, &mut path, None);
         assert!(response.starts_with("noop:"), "response was: {}", response);
     }
 
@@ -1762,7 +1872,7 @@ mod tests {
     fn test_process_command_start_error() {
         let mut recorder = MockRecorder::new().with_start_error("デバイスエラー");
         let mut path = None;
-        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path);
+        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path, None);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("デバイスエラー"));
     }
@@ -1774,7 +1884,7 @@ mod tests {
             .already_recording()
             .with_stop_error("ファイナライズ失敗");
         let mut current = Some(PathBuf::from("/tmp/test.wav"));
-        let (response, insert) = process_command("stop", &mut recorder, &mut current);
+        let (response, insert) = process_command("stop", &mut recorder, &mut current, None);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("ファイナライズ失敗"));
         assert!(insert.is_none()); // エラー時は挿入しない
@@ -1785,8 +1895,39 @@ mod tests {
     fn test_process_command_unknown() {
         let mut recorder = MockRecorder::new();
         let mut path = None;
-        let (response, _) = process_command("unknown_cmd", &mut recorder, &mut path);
+        let (response, _) = process_command("unknown_cmd", &mut recorder, &mut path, None);
         assert!(response.starts_with("err:"), "response was: {}", response);
+    }
+
+    #[test]
+    fn test_resolve_recording_path_absolute() {
+        let path = Path::new(r"C:\Recordings\test.wav");
+
+        let resolved =
+            resolve_recording_path(path, None).unwrap();
+
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"C:\Recordings\test.wav")
+        );
+    }
+
+    #[test]
+    fn test_resolve_recording_path_relative() {
+        let base = std::env::temp_dir()
+            .join("aviutl2_audio_rec_project_test");
+
+        let relative = Path::new("Audio/test.wav");
+
+        let resolved =
+            resolve_recording_path(relative, Some(&base)).unwrap();
+
+        assert_eq!(
+            resolved,
+            base.join("Audio").join("test.wav")
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ─── build_audio_file_alias のテスト ───

@@ -213,21 +213,29 @@ fn main() {
             match args[2].as_str() {
                 "save-path" => {
                     let dir = &args[3];
+                    let dir_path = Path::new(dir);
 
-                    // ディレクトリの存在と種別をチェック
-                    match Path::new(dir).metadata() {
-                        Ok(metadata) => {
-                            if !metadata.is_dir() {
+                    // 絶対パスの場合のみ、その場で存在確認する。
+                    // 相対パスはAviUtl2プロジェクトディレクトリ基準で
+                    // プラグイン側が解決するため、ここでは存在確認しない。
+                    if dir_path.is_absolute() {
+                        match dir_path.metadata() {
+                            Ok(metadata) => {
+                                if !metadata.is_dir() {
+                                    eprintln!(
+                                        "エラー: 指定したパスはディレクトリではありません: {}",
+                                        dir
+                                    );
+                                    process::exit(1);
+                                }
+                            }
+                            Err(_) => {
                                 eprintln!(
-                                    "エラー: 指定したパスはディレクトリではありません: {}",
+                                    "エラー: 指定したディレクトリが存在しません: {}",
                                     dir
                                 );
                                 process::exit(1);
                             }
-                        }
-                        Err(_) => {
-                            eprintln!("エラー: 指定したディレクトリが存在しません: {}", dir);
-                            process::exit(1);
                         }
                     }
 
@@ -312,7 +320,11 @@ fn main() {
 fn print_usage(program: &str) {
     eprintln!("使用方法:");
     eprintln!(
-        "  {} start [<WAVファイルの絶対パス>]  -- 録音を開始する（パス省略時はデフォルト保存先を使用）",
+        "  {} start [<WAVファイルのパス>]      -- 録音を開始する（相対パスはプロジェクト基準）",
+        program
+    );
+    eprintln!(
+        "  {} config save-path Audio  # プロジェクトフォルダ内の Audio を使用",
         program
     );
     eprintln!(
@@ -393,6 +405,12 @@ pub fn validate_output_path(path: &str) -> Result<(), String> {
             "'.wav' 拡張子のファイルを指定してください: {}",
             path
         ));
+    }
+
+    // 相対パスはAviUtl2プロジェクトディレクトリ基準で
+    // プラグイン側が解決するため、ここではファイルシステム検証を行わない。
+    if !p.is_absolute() {
+        return Ok(());
     }
 
     // ─── 親ディレクトリの存在チェック ───
@@ -663,6 +681,17 @@ mod tests {
         assert!(
             config.save_path.is_none(),
             "ファイル未存在時はデフォルトにフォールバックするはず"
+        );
+    }
+
+    #[test]
+    fn test_validate_relative_output_path() {
+        let result = validate_output_path("Audio/output.wav");
+
+        assert!(
+            result.is_ok(),
+            "相対パスはプラグイン側で解決されるため有効なはず: {:?}",
+            result
         );
     }
 }
