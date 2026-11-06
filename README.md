@@ -42,7 +42,7 @@ GUI の操作をエミュレートするのではなく、Named Pipe を通じ�
 aviutl2-cli は [Releases](https://github.com/sevenc-nanashi/aviutl2-cli/releases/latest) からダウンロードするか、`cargo-binstall` でインストールできます。
 
 ```sh
-cargo binstall aviutl2-cli
+cargo install aviutl2-cli
 ```
 
 リポジトリをクローンし、初回セットアップを実行します。
