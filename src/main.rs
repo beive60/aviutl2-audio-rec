@@ -176,6 +176,10 @@ fn main() {
                 process::exit(1);
             }
 
+            // プラグインは別プロセス（AviUtl2）で動作し、カレントディレクトリが異なるため、
+            // 相対パスは CLI 側で絶対パスに変換してから送信する。
+            let output_path = to_absolute_path(&output_path);
+
             println!("録音先: {}", output_path);
 
             // バッファサイズを設定ファイルから取得し、プロトコル形式に含める。
@@ -365,6 +369,17 @@ fn handle_response(response: &str) {
 // 事前検証
 // ─────────────────────────────────────────────────────────────
 
+/// 相対パスをカレントディレクトリ基準の絶対パスに変換する。
+///
+/// プラグインは AviUtl2 側の別プロセスで動作しカレントディレクトリが異なるため、
+/// 相対パスのまま送ると意図しない場所を指してしまう。変換に失敗した場合は入力をそのまま返す。
+pub fn to_absolute_path(path: &str) -> String {
+    match std::path::absolute(path) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
 /// 出力パスの事前検証（Pre-flight validation）を行う。
 ///
 /// 以下の条件をチェックする：
@@ -552,6 +567,26 @@ fn connect_with_retry(pipe_name: PCWSTR) -> Result<windows::Win32::Foundation::H
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── to_absolute_path のテスト ───
+
+    /// 相対パスはカレントディレクトリ基準の絶対パスに変換されることを確認する。
+    #[test]
+    fn test_to_absolute_path_relative() {
+        let result = to_absolute_path("regression/artifacts/test.wav");
+        let p = Path::new(&result);
+        assert!(p.is_absolute(), "絶対パスのはず: {}", result);
+        assert!(p.ends_with(Path::new("regression/artifacts/test.wav")));
+    }
+
+    /// 既に絶対パスの場合は変化しないことを確認する。
+    #[test]
+    fn test_to_absolute_path_already_absolute() {
+        let mut path = std::env::temp_dir();
+        path.push("abs_test.wav");
+        let input = path.to_str().unwrap();
+        assert_eq!(to_absolute_path(input), input);
+    }
 
     // ─── validate_output_path のテスト ───
 
