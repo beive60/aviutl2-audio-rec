@@ -21,6 +21,10 @@ if not exist "%CLI_PATH%" (
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 if not exist "%OUTPUT_DIR%\logs" mkdir "%OUTPUT_DIR%\logs"
 
+rem 絶対パスに変換（プラグイン側プロセスの cwd に依存しないようにする）
+for %%i in ("%OUTPUT_DIR%") do set OUTPUT_DIR=%%~fi
+for %%i in ("%CLI_PATH%") do set CLI_PATH=%%~fi
+
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set TS=%%i
 
 set WAV_FILE=%OUTPUT_DIR%\%CASE_ID%-%TS%.wav
