@@ -55,13 +55,11 @@ const STEP_FRAMES: usize = 1;
 
 /// タイムラインへの挿入結果。
 #[derive(Debug)]
-pub enum TimelineInsertResult<T, E> {
+pub enum TimelineInsertResult<E> {
     /// 挿入成功。
     Inserted {
         /// 実際に挿入した開始フレーム番号。
         frame: usize,
-        /// 挿入操作（`try_insert` クロージャ）の戻り値。
-        value: T,
     },
     /// 指定した試行回数（[`MAX_INSERT_ATTEMPTS`]）以内に挿入可能な位置が見つからなかった。
     ///
@@ -100,24 +98,24 @@ pub enum TimelineInsertResult<T, E> {
 /// * `start_frame` - 挿入目標フレーム番号（0 始まり）
 /// * `length_frames` - 挿入するオブジェクトの長さ（フレーム数）
 /// * `try_insert` - オブジェクト挿入を試みるクロージャ。
-///   引数は `(layer, frame, length_frames)` で、成功時は `Ok(T)`、失敗時は `Err(E)` を返す。
+///   引数は `(layer, frame, length_frames)` で、成功時は `Ok(())`、失敗時は `Err(E)` を返す。
 /// * `retry_if` - エラーを再試行可能と見なすかを判定するクロージャ。
 ///   `true` を返したエラーのみフォールバック探索を継続する。
 ///
 /// # 戻り値
 ///
-/// - 挿入成功時は [`TimelineInsertResult::Inserted`]（実際の挿入フレームと戻り値を含む）
+/// - 挿入成功時は [`TimelineInsertResult::Inserted`]（実際の挿入フレームを含む）
 /// - 試行回数内に挿入可能位置が見つからなかった場合は [`TimelineInsertResult::NotFound`]
 /// - 再試行不能なエラー発生時は [`TimelineInsertResult::Failed`]
-pub fn insert_at_available_frame<T, E, F, R>(
+pub fn insert_at_available_frame<E, F, R>(
     layer: usize,
     start_frame: usize,
     length_frames: usize,
     try_insert: F,
     retry_if: R,
-) -> TimelineInsertResult<T, E>
+) -> TimelineInsertResult<E>
 where
-    F: Fn(usize, usize, usize) -> Result<T, E>,
+    F: Fn(usize, usize, usize) -> Result<(), E>,
     R: Fn(&E) -> bool,
 {
     let mut frame = start_frame;
@@ -125,8 +123,8 @@ where
 
     for _attempt in 0..MAX_INSERT_ATTEMPTS {
         match try_insert(layer, frame, length_frames) {
-            Ok(value) => {
-                return TimelineInsertResult::Inserted { frame, value };
+            Ok(()) => {
+                return TimelineInsertResult::Inserted { frame };
             }
             Err(error) => {
                 if !retry_if(&error) {
@@ -161,13 +159,12 @@ mod tests {
             0,
             100,
             60,
-            |_layer, frame, _length| Ok::<usize, String>(frame),
+            |_layer, _frame, _length| Ok::<(), String>(()),
             |_error| true,
         );
         match result {
-            TimelineInsertResult::Inserted { frame, value } => {
+            TimelineInsertResult::Inserted { frame } => {
                 assert_eq!(frame, 100, "目標フレームで挿入されるはず");
-                assert_eq!(value, 100);
             }
             TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
             TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
@@ -182,11 +179,7 @@ mod tests {
             10,
             30,
             |_layer, frame, _length| {
-                if frame == 10 {
-                    Err("occupied")
-                } else {
-                    Ok(frame)
-                }
+                if frame == 10 { Err("occupied") } else { Ok(()) }
             },
             |_error| true,
         );
@@ -211,7 +204,7 @@ mod tests {
                 if frame <= occupied_until {
                     Err("occupied")
                 } else {
-                    Ok(frame)
+                    Ok(())
                 }
             },
             |_error| true,
@@ -263,7 +256,7 @@ mod tests {
                 if frame < start + threshold {
                     Err("occupied")
                 } else {
-                    Ok(frame)
+                    Ok(())
                 }
             },
             |_error| true,
@@ -293,7 +286,7 @@ mod tests {
                 if frame < start + threshold {
                     Err("occupied")
                 } else {
-                    Ok(frame)
+                    Ok(())
                 }
             },
             |_error| true,
@@ -372,45 +365,42 @@ mod tests {
     /// レイヤー番号がクロージャに正しく渡されることを確認する。
     #[test]
     fn test_correct_layer_passed_to_closure() {
+        let received = std::cell::Cell::new(None);
         let result = insert_at_available_frame(
             3,
             0,
             10,
-            |layer, frame, _length| Ok::<(usize, usize), String>((layer, frame)),
+            |layer, _frame, _length| {
+                received.set(Some(layer));
+                Ok::<(), String>(())
+            },
             |_error| true,
         );
-        match result {
-            TimelineInsertResult::Inserted {
-                value: (layer, _), ..
-            } => {
-                assert_eq!(layer, 3, "レイヤー番号が正しく渡されるはず");
-            }
-            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
-            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
-        }
+        assert!(matches!(result, TimelineInsertResult::Inserted { .. }));
+        assert_eq!(received.get(), Some(3), "レイヤー番号が正しく渡されるはず");
     }
 
     /// オブジェクト長がクロージャに正しく渡されることを確認する。
     #[test]
     fn test_correct_length_passed_to_closure() {
         let expected_length = 120usize;
+        let received = std::cell::Cell::new(None);
         let result = insert_at_available_frame(
             0,
             0,
             expected_length,
-            |_layer, _frame, length| Ok::<usize, String>(length),
+            |_layer, _frame, length| {
+                received.set(Some(length));
+                Ok::<(), String>(())
+            },
             |_error| true,
         );
-        match result {
-            TimelineInsertResult::Inserted { value: length, .. } => {
-                assert_eq!(
-                    length, expected_length,
-                    "オブジェクト長が正しく渡されるはず"
-                );
-            }
-            TimelineInsertResult::NotFound { .. } => panic!("挿入は成功するはず"),
-            TimelineInsertResult::Failed { .. } => panic!("挿入は成功するはず"),
-        }
+        assert!(matches!(result, TimelineInsertResult::Inserted { .. }));
+        assert_eq!(
+            received.get(),
+            Some(expected_length),
+            "オブジェクト長が正しく渡されるはず"
+        );
     }
 
     /// 非ゼロの開始フレームから探索が始まることを確認する。
@@ -420,7 +410,7 @@ mod tests {
             0,
             500,
             60,
-            |_layer, frame, _length| Ok::<usize, String>(frame),
+            |_layer, _frame, _length| Ok::<(), String>(()),
             |_error| true,
         );
         match result {

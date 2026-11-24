@@ -34,8 +34,8 @@
 //! - レスポンス：`ok` / `noop:<理由>` / `err:<理由>`
 //! - 最大ペイロード長：65,536 バイト
 
-mod shared_config;
-mod timeline_inserter;
+pub mod shared_config;
+pub mod timeline_inserter;
 
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -51,9 +51,7 @@ use aviutl2::generic::{
 };
 use aviutl2_eframe::{self, egui};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -600,7 +598,11 @@ impl aviutl2_eframe::eframe::App for RecordingPanelApp {
             }
         });
         ui.separator();
-        ui.label(if is_recording { "● 録音中" } else { "○ 停止中" });
+        ui.label(if is_recording {
+            "● 録音中"
+        } else {
+            "○ 停止中"
+        });
     }
 }
 
@@ -617,21 +619,22 @@ impl GenericPlugin for AudioRecPlugin {
         tracing::info!("AviUtl2 マイク録音プラグインを初期化中...");
 
         let recording = Arc::clone(recording_state_flag());
-        let panel = aviutl2_eframe::EframeWindow::new("AviUtl2AudioRecPanel", move |cc, _handle| {
-            cc.egui_ctx.all_styles_mut(|style| {
-                style.visuals = aviutl2_eframe::aviutl2_visuals();
-            });
+        let panel =
+            aviutl2_eframe::EframeWindow::new("AviUtl2AudioRecPanel", move |cc, _handle| {
+                cc.egui_ctx.all_styles_mut(|style| {
+                    style.visuals = aviutl2_eframe::aviutl2_visuals();
+                });
 
-            // AviUtl2 が設定しているフォントを egui に適用する。
-            // aviutl2_eframe::aviutl2_fonts() は fontdb でシステムフォントを検索し、
-            // AviUtl2 の Control / EditControl 設定フォントを読み込む。
-            cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
+                // AviUtl2 が設定しているフォントを egui に適用する。
+                // aviutl2_eframe::aviutl2_fonts() は fontdb でシステムフォントを検索し、
+                // AviUtl2 の Control / EditControl 設定フォントを読み込む。
+                cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
 
-            PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
-            let app: Box<dyn aviutl2_eframe::eframe::App> =
-                Box::new(RecordingPanelApp { recording });
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
-        })?;
+                PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
+                let app: Box<dyn aviutl2_eframe::eframe::App> =
+                    Box::new(RecordingPanelApp { recording });
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
+            })?;
 
         Ok(Self {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -658,33 +661,45 @@ impl GenericPlugin for AudioRecPlugin {
         tracing::info!("プラグインをホストに登録中...");
 
         // AviUtl2 UI から録音操作できるようにメニューを登録する
-        registry.register_edit_menu("録音開始", || {
+        registry.register_edit_menu("AudioRec\\録音開始", || {
             on_ui_start_recording();
         });
-        registry.register_edit_menu("録音停止", || {
+        registry.register_edit_menu("AudioRec\\録音停止", || {
             on_ui_stop_recording();
         });
         registry.register_edit_menu(
-            "録音設定\\保存先をクリップボードから設定",
+            "AudioRec\\録音設定\\保存先をクリップボードから設定",
             || {
                 on_ui_set_save_path_from_clipboard();
             },
         );
-        registry.register_edit_menu("録音設定\\バッファサイズ\\既定値", || {
+        registry.register_edit_menu("AudioRec\\設定\\バッファサイズ\\既定値", || {
             on_ui_set_buffer_size(None);
         });
-        registry.register_edit_menu("録音設定\\バッファサイズ\\1024", || {
-            on_ui_set_buffer_size(Some(1024));
-        });
-        registry.register_edit_menu("録音設定\\バッファサイズ\\2048", || {
-            on_ui_set_buffer_size(Some(2048));
-        });
-        registry.register_edit_menu("録音設定\\バッファサイズ\\4096", || {
-            on_ui_set_buffer_size(Some(4096));
-        });
-        registry.register_edit_menu("録音設定\\バッファサイズ\\8192", || {
-            on_ui_set_buffer_size(Some(8192));
-        });
+        registry.register_edit_menu(
+            "AudioRec\\録音設定\\バッファサイズ\\1024",
+            || {
+                on_ui_set_buffer_size(Some(1024));
+            },
+        );
+        registry.register_edit_menu(
+            "AudioRec\\録音設定\\バッファサイズ\\2048",
+            || {
+                on_ui_set_buffer_size(Some(2048));
+            },
+        );
+        registry.register_edit_menu(
+            "AudioRec\\録音設定\\バッファサイズ\\4096",
+            || {
+                on_ui_set_buffer_size(Some(4096));
+            },
+        );
+        registry.register_edit_menu(
+            "AudioRec\\録音設定\\バッファサイズ\\8192",
+            || {
+                on_ui_set_buffer_size(Some(8192));
+            },
+        );
         match self.panel.handle() {
             Ok(panel_handle) => {
                 if let Err(e) = registry.register_window_client("録音パネル", &panel_handle) {
@@ -1262,7 +1277,9 @@ fn insert_into_timeline(edit_handle: &Arc<EditHandle>, path: PathBuf) {
             length_frames,
             |ins_layer, ins_frame, ins_length| {
                 let alias = build_audio_file_alias(&path_str, ins_layer, ins_frame, ins_length);
-                edit_section.create_object_from_alias(&alias, ins_layer, ins_frame, ins_length)
+                edit_section
+                    .create_object_from_alias(&alias, ins_layer, ins_frame, ins_length)
+                    .map(|_| ())
             },
             is_retryable_timeline_insert_error,
         );

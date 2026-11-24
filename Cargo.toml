@@ -6,7 +6,7 @@ edition = "2024"
 # プラグイン DLL（.aux2）ターゲット
 [lib]
 name = "aviutl2_audio_rec"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 # CLI クライアント実行ファイルターゲット
 [[bin]]

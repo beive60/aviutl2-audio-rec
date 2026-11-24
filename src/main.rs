@@ -53,7 +53,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
-mod shared_config;
+use aviutl2_audio_rec::shared_config;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 use windows::Win32::Storage::FileSystem::{

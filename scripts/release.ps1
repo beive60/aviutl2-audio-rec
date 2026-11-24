@@ -35,45 +35,61 @@ function Assert-CommandExists {
     }
 }
 
+function Assert-LastExitCode {
+    param([string]$Action)
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Action failed with exit code $LASTEXITCODE."
+    }
+}
+
 try {
     Write-Host "=== 0/5: Check Prerequisites ==="
     "cargo", "signtool", "git", "gh" | ForEach-Object { Assert-CommandExists $_ }
     Write-Host "All prerequisites found."
 
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+
     Write-Host "=== 1/5: Build ==="
 
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed." }
+    cargo build --release --manifest-path (Join-Path $repoRoot "Cargo.toml")
+    Assert-LastExitCode "cargo build --release"
 
     Write-Host "=== 2/5: Sign ==="
 
-    $releaseDir = ".\target\release"
-    $exePath = "$releaseDir\audio_rec_cli.exe"
-    $dllPath = "$releaseDir\aviutl2_audio_rec.dll"
+    $releaseDir = Join-Path $repoRoot "target\release"
+    $exePath = Join-Path $releaseDir "audio_rec_cli.exe"
+    $dllPath = Join-Path $releaseDir "aviutl2_audio_rec.dll"
 
     # dll は cdylib のビルド成果物であり PE バイナリのため signtool で署名可能
     # リリース ZIP に同梱する際に .aux2 にリネームする
     signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $exePath
+    Assert-LastExitCode "signtool sign (audio_rec_cli.exe)"
     signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $dllPath
+    Assert-LastExitCode "signtool sign (aviutl2_audio_rec.dll)"
 
     signtool verify /pa $exePath
+    Assert-LastExitCode "signtool verify (audio_rec_cli.exe)"
     signtool verify /pa $dllPath
+    Assert-LastExitCode "signtool verify (aviutl2_audio_rec.dll)"
 
     Write-Host "=== 3/5: Zip Artifacts ==="
 
-    $stagingDir = ".\dist\release"
-    $zipFileName = "aviutl2-audio-rec-v$($Version).zip"
-    $zipPath = ".\dist\$zipFileName"
+    $distDir = Join-Path $repoRoot "dist"
+    $stagingDir = Join-Path $distDir "release"
+    $packageRoot = Join-Path $stagingDir "Plugin\Beive60"
+    $zipFileName = "aviutl2-audio-rec-v$($Version).au2pkg.zip"
+    $zipPath = Join-Path $distDir $zipFileName
 
     # Clean and create staging directory
     if (Test-Path $stagingDir) { Remove-Item -Recurse -Force $stagingDir }
-    New-Item -ItemType Directory -Path $stagingDir | Out-Null
+    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 
     # Copy files to the staging directory
     Copy-Item -Path $exePath -Destination $stagingDir
-    Copy-Item -Path $dllPath -Destination "$stagingDir\aviutl2_audio_rec.aux2"
-    Copy-Item -Path ".\README.md" -Destination $stagingDir
-    Copy-Item -Path ".\LICENSE" -Destination $stagingDir
+    Copy-Item -Path $dllPath -Destination (Join-Path $packageRoot "aviutl2_audio_rec.aux2")
+    Copy-Item -Path (Join-Path $repoRoot "README.md") -Destination $stagingDir
+    Copy-Item -Path (Join-Path $repoRoot "LICENSE") -Destination $stagingDir
 
     # Create the archive from the staging directory's contents
     Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipPath -Force
@@ -92,10 +108,14 @@ try {
     }
     Write-Host "GitHub CLI is authenticated."
 
-    git tag "v$Version"
-    git push origin "v$Version"
+    git -C $repoRoot tag "v$Version"
+    Assert-LastExitCode "git tag"
 
-    gh release create "v$Version" $zipPath --title "Release v$Version" --generate-notes
+    git -C $repoRoot push origin "v$Version"
+    Assert-LastExitCode "git push origin v$Version"
+
+    gh release create "v$Version" $zipPath --repo beive60/aviutl2-audio-rec --title "Release v$Version" --generate-notes
+    Assert-LastExitCode "gh release create"
 
     Write-Host "=== 5/5: Done ==="
     Write-Host "Released v$Version successfully."
