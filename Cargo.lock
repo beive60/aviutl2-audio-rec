@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "aviutl2_audio_rec"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "aviutl2",
  "aviutl2-eframe",

@@ -3,7 +3,7 @@
 [project]
 id = "aviutl2-audio-rec"
 name = "aviutl2-audio-rec"
-version = "0.1.1"
+version = "0.4.1"
 
 [development]
 aviutl2_version = "latest"
@@ -26,7 +26,7 @@ build = { group = "cargo_build_release" }
 source = "target/release/aviutl2_audio_rec.dll"
 
 [artifacts.cli]
-destination = "audio_rec_cli.exe"
+destination = "Plugin/aviutl2-audio-rec/audio_rec_cli.exe"
 placement_method = "copy"
 
 [artifacts.cli.profiles.debug]

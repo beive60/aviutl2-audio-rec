@@ -56,9 +56,6 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
@@ -660,46 +657,8 @@ impl GenericPlugin for AudioRecPlugin {
     fn register(&mut self, registry: &mut HostAppHandle) {
         tracing::info!("プラグインをホストに登録中...");
 
-        // AviUtl2 UI から録音操作できるようにメニューを登録する
-        registry.register_edit_menu("AudioRec\\録音開始", || {
-            on_ui_start_recording();
-        });
-        registry.register_edit_menu("AudioRec\\録音停止", || {
-            on_ui_stop_recording();
-        });
-        registry.register_edit_menu(
-            "AudioRec\\録音設定\\保存先をクリップボードから設定",
-            || {
-                on_ui_set_save_path_from_clipboard();
-            },
-        );
-        registry.register_edit_menu("AudioRec\\設定\\バッファサイズ\\既定値", || {
-            on_ui_set_buffer_size(None);
-        });
-        registry.register_edit_menu(
-            "AudioRec\\録音設定\\バッファサイズ\\1024",
-            || {
-                on_ui_set_buffer_size(Some(1024));
-            },
-        );
-        registry.register_edit_menu(
-            "AudioRec\\録音設定\\バッファサイズ\\2048",
-            || {
-                on_ui_set_buffer_size(Some(2048));
-            },
-        );
-        registry.register_edit_menu(
-            "AudioRec\\録音設定\\バッファサイズ\\4096",
-            || {
-                on_ui_set_buffer_size(Some(4096));
-            },
-        );
-        registry.register_edit_menu(
-            "AudioRec\\録音設定\\バッファサイズ\\8192",
-            || {
-                on_ui_set_buffer_size(Some(8192));
-            },
-        );
+        // 編集メニュー・プラグイン設定メニューを登録する
+        registry.register_menus::<Self>();
         match self.panel.handle() {
             Ok(panel_handle) => {
                 if let Err(e) = registry.register_window_client("録音パネル", &panel_handle) {
@@ -747,6 +706,31 @@ impl GenericPlugin for AudioRecPlugin {
                 // スレッドは起動済みだが参照を保持できないため、デタッチされる
             }
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// メニュー定義（編集メニュー / 設定 → プラグイン設定）
+// ─────────────────────────────────────────────────────────────
+
+#[aviutl2::generic::menus]
+impl AudioRecPlugin {
+    #[edit(name = "AudioRec\\録音開始")]
+    fn menu_start_recording(&mut self) -> aviutl2::AnyResult<()> {
+        on_ui_start_recording();
+        Ok(())
+    }
+
+    #[edit(name = "AudioRec\\録音停止")]
+    fn menu_stop_recording(&mut self) -> aviutl2::AnyResult<()> {
+        on_ui_stop_recording();
+        Ok(())
+    }
+
+    #[config(name = "[AudioRec] 設定...")]
+    fn menu_open_settings(&mut self, hwnd: aviutl2::Win32WindowHandle) -> aviutl2::AnyResult<()> {
+        run_settings_dialog(hwnd.hwnd.get());
+        Ok(())
     }
 }
 
@@ -840,45 +824,254 @@ fn on_ui_stop_recording() {
     dispatch_ui_command_with_kind("stop", UiCommandKind::Stop);
 }
 
-/// UI メニュー「保存先をクリップボードから設定」が押されたときの処理。
-fn on_ui_set_save_path_from_clipboard() {
-    let text = match read_clipboard_unicode_text() {
-        Ok(text) => text,
+const SETTINGS_ID_PICK_FOLDER: i32 = 100;
+const SETTINGS_ID_BUFFER_SIZE: i32 = 101;
+/// バッファサイズ選択肢（ボタン ID = BUFFER_CHOICE_BASE + index）
+const BUFFER_CHOICES: [(&str, Option<u32>); 5] = [
+    ("既定値", None),
+    ("1024", Some(1024)),
+    ("2048", Some(2048)),
+    ("4096", Some(4096)),
+    ("8192", Some(8192)),
+];
+const BUFFER_CHOICE_BASE: i32 = 200;
+
+/// 「設定 → プラグイン設定 → [AudioRec] 設定...」で開く設定ダイアログ。
+/// 閉じるまで、操作のたびに最新の設定値を表示して再表示する。
+fn run_settings_dialog(owner_hwnd: isize) {
+    loop {
+        let config = shared_config::load_config();
+        let content = format!(
+            "保存先: {}\nバッファサイズ: {}",
+            config.save_path.as_deref().unwrap_or("（未設定）"),
+            match config.buffer_size_frames {
+                Some(n) => format!("{} フレーム", n),
+                None => "既定値".to_string(),
+            }
+        );
+        let choice = task_dialog(
+            owner_hwnd,
+            "AudioRec 設定",
+            "録音設定",
+            &content,
+            &[
+                (SETTINGS_ID_PICK_FOLDER, "保存先をフォルダ選択..."),
+                (SETTINGS_ID_BUFFER_SIZE, "バッファサイズを変更..."),
+            ],
+        );
+        match choice {
+            Ok(SETTINGS_ID_PICK_FOLDER) => on_ui_set_save_path_with_dialog(owner_hwnd),
+            Ok(SETTINGS_ID_BUFFER_SIZE) => {
+                let buttons: Vec<(i32, &str)> = BUFFER_CHOICES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (label, _))| (BUFFER_CHOICE_BASE + i as i32, *label))
+                    .collect();
+                if let Ok(id) = task_dialog(
+                    owner_hwnd,
+                    "AudioRec 設定",
+                    "バッファサイズを選択",
+                    "値を小さくすると遅延が減りますが、音切れしやすくなります。",
+                    &buttons,
+                ) && let Some((_, size)) = BUFFER_CHOICES.get((id - BUFFER_CHOICE_BASE) as usize)
+                    && id >= BUFFER_CHOICE_BASE
+                {
+                    on_ui_set_buffer_size(*size);
+                }
+            }
+            Ok(_) => break, // 閉じる
+            Err(msg) => {
+                tracing::error!("設定ダイアログの表示に失敗しました: {}", msg);
+                break;
+            }
+        }
+    }
+}
+
+/// コマンドリンク付き TaskDialog を表示し、押されたボタン ID を返す
+/// （「閉じる」/ ×ボタンは `IDCLOSE` など設定外の値）。
+///
+/// プラグイン DLL はホスト（AviUtl2）の manifest に依存せずに済むよう、
+/// 一時 manifest の Activation Context で comctl32 v6 を有効化し、
+/// `TaskDialogIndirect` を実行時に解決して呼び出す。
+fn task_dialog(
+    owner_hwnd: isize,
+    title: &str,
+    instruction: &str,
+    content: &str,
+    buttons: &[(i32, &str)],
+) -> Result<i32, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::ApplicationInstallationAndServicing::{
+        ACTCTXW, ActivateActCtx, CreateActCtxW, DeactivateActCtx, ReleaseActCtx,
+    };
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::UI::Controls::{
+        TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TDCBF_CLOSE_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TDF_USE_COMMAND_LINKS,
+    };
+    use windows::core::{HSTRING, s, w};
+
+    const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency><dependentAssembly>
+    <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+      version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+  </dependentAssembly></dependency>
+</assembly>"#;
+    type TaskDialogIndirectFn = unsafe extern "system" fn(
+        *const TASKDIALOGCONFIG,
+        *mut i32,
+        *mut i32,
+        *mut windows::core::BOOL,
+    ) -> windows::core::HRESULT;
+
+    // comctl32 v6 を有効化する Activation Context を作成
+    let manifest_path = std::env::temp_dir().join("aviutl2_audio_rec_comctl6.manifest");
+    std::fs::write(&manifest_path, MANIFEST).map_err(|e| format!("manifest 書き込み失敗: {}", e))?;
+    let manifest_w = HSTRING::from(manifest_path.as_os_str());
+    let actctx = ACTCTXW {
+        cbSize: std::mem::size_of::<ACTCTXW>() as u32,
+        lpSource: PCWSTR(manifest_w.as_ptr()),
+        ..Default::default()
+    };
+    let hctx = unsafe { CreateActCtxW(&actctx) }
+        .map_err(|e| format!("CreateActCtxW が失敗しました: {}", e))?;
+    let mut cookie = 0usize;
+    if let Err(e) = unsafe { ActivateActCtx(Some(hctx), &mut cookie) } {
+        unsafe { ReleaseActCtx(hctx) };
+        return Err(format!("ActivateActCtx が失敗しました: {}", e));
+    }
+
+    let result = (|| {
+        let lib = unsafe { LoadLibraryW(w!("comctl32.dll")) }
+            .map_err(|e| format!("comctl32.dll の読み込みに失敗: {}", e))?;
+        let proc = unsafe { GetProcAddress(lib, s!("TaskDialogIndirect")) }
+            .ok_or("TaskDialogIndirect が見つかりません")?;
+        let task_dialog_indirect: TaskDialogIndirectFn = unsafe { std::mem::transmute(proc) };
+
+        let title_w = HSTRING::from(title);
+        let instruction_w = HSTRING::from(instruction);
+        let content_w = HSTRING::from(content);
+        let labels: Vec<HSTRING> = buttons.iter().map(|(_, l)| HSTRING::from(*l)).collect();
+        let button_defs: Vec<TASKDIALOG_BUTTON> = buttons
+            .iter()
+            .zip(&labels)
+            .map(|((id, _), label)| TASKDIALOG_BUTTON {
+                nButtonID: *id,
+                pszButtonText: PCWSTR(label.as_ptr()),
+            })
+            .collect();
+
+        let config = TASKDIALOGCONFIG {
+            cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+            hwndParent: HWND(owner_hwnd as *mut core::ffi::c_void),
+            dwFlags: TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION,
+            dwCommonButtons: TDCBF_CLOSE_BUTTON,
+            pszWindowTitle: PCWSTR(title_w.as_ptr()),
+            pszMainInstruction: PCWSTR(instruction_w.as_ptr()),
+            pszContent: PCWSTR(content_w.as_ptr()),
+            cButtons: button_defs.len() as u32,
+            pButtons: button_defs.as_ptr(),
+            ..Default::default()
+        };
+        let mut pressed = 0i32;
+        unsafe {
+            task_dialog_indirect(&config, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut())
+        }
+        .ok()
+        .map_err(|e| format!("TaskDialogIndirect が失敗しました: {}", e))?;
+        Ok(pressed)
+    })();
+
+    let _ = unsafe { DeactivateActCtx(0, cookie) };
+    unsafe { ReleaseActCtx(hctx) };
+    result
+}
+
+/// フォルダ選択ダイアログで保存先を設定する。
+fn on_ui_set_save_path_with_dialog(owner_hwnd: isize) {
+    let mut config = shared_config::load_config();
+    let initial = config
+        .save_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+
+    let selected = match pick_folder_dialog(owner_hwnd, initial.as_deref()) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return, // キャンセル
         Err(msg) => {
-            tracing::error!("クリップボードから保存先の取得に失敗しました: {}", msg);
+            tracing::error!("フォルダ選択ダイアログに失敗しました: {}", msg);
             return;
         }
     };
 
-    let normalized = text.trim().trim_matches('"');
-    if normalized.is_empty() {
-        tracing::error!("クリップボードの内容が空です。保存先を設定できません");
-        return;
-    }
-
-    let save_dir = PathBuf::from(normalized);
-    if !save_dir.is_dir() {
-        tracing::error!(
-            "クリップボードの内容は既存ディレクトリではありません: {}",
-            save_dir.display()
-        );
-        return;
-    }
-
-    let mut config = shared_config::load_config();
-    config.save_path = Some(save_dir.to_string_lossy().into_owned());
+    config.save_path = Some(selected.to_string_lossy().into_owned());
     match shared_config::save_config(&config) {
-        Ok(path) => {
-            tracing::info!(
-                "保存先を更新しました: save_path={}, config={}",
-                save_dir.display(),
-                path.display()
-            );
-        }
-        Err(msg) => {
-            tracing::error!("保存先設定の保存に失敗しました: {}", msg);
+        Ok(path) => tracing::info!(
+            "保存先を更新しました: save_path={}, config={}",
+            selected.display(),
+            path.display()
+        ),
+        Err(msg) => tracing::error!("保存先設定の保存に失敗しました: {}", msg),
+    }
+}
+
+/// Windows 標準のフォルダ選択ダイアログ（IFileOpenDialog）を表示する。
+/// キャンセル時は `Ok(None)`。
+fn pick_folder_dialog(
+    owner_hwnd: isize,
+    initial_dir: Option<&std::path::Path>,
+) -> Result<Option<PathBuf>, String> {
+    use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem,
+        SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    };
+    use windows::core::{HRESULT, HSTRING};
+
+    // 既に初期化済みでも問題ないため結果は無視する
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+
+    let dialog: IFileOpenDialog =
+        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|e| format!("IFileOpenDialog の生成に失敗: {}", e))?;
+    unsafe {
+        let options = dialog.GetOptions().map_err(|e| e.to_string())?;
+        dialog
+            .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
+            .map_err(|e| e.to_string())?;
+        dialog
+            .SetTitle(&HSTRING::from("録音ファイルの保存先を選択"))
+            .map_err(|e| e.to_string())?;
+        if let Some(dir) = initial_dir
+            && let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(
+                &HSTRING::from(dir.as_os_str()),
+                None,
+            )
+        {
+            let _ = dialog.SetFolder(&item);
         }
     }
+
+    let owner = HWND(owner_hwnd as *mut core::ffi::c_void);
+    if let Err(e) = unsafe { dialog.Show(Some(owner)) } {
+        if e.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
+            return Ok(None);
+        }
+        return Err(format!("ダイアログの表示に失敗: {}", e));
+    }
+
+    let item = unsafe { dialog.GetResult() }.map_err(|e| e.to_string())?;
+    let name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.map_err(|e| e.to_string())?;
+    let path = unsafe { name.to_string() }.map_err(|e| e.to_string());
+    unsafe { CoTaskMemFree(Some(name.0 as *const _)) };
+    Ok(Some(PathBuf::from(path?)))
 }
 
 /// UI メニュー「バッファサイズ設定」が押されたときの処理。
@@ -901,47 +1094,6 @@ fn on_ui_set_buffer_size(buffer_size_frames: Option<u32>) {
             tracing::error!("バッファサイズ設定の保存に失敗しました: {}", msg);
         }
     }
-}
-
-/// クリップボードの Unicode テキスト（CF_UNICODETEXT）を読み取る。
-fn read_clipboard_unicode_text() -> Result<String, String> {
-    unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard が失敗しました: {}", e))?;
-
-    struct ClipboardGuard;
-    impl Drop for ClipboardGuard {
-        fn drop(&mut self) {
-            let _ = unsafe { CloseClipboard() };
-        }
-    }
-    let _clipboard_guard = ClipboardGuard;
-
-    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }
-        .map_err(|e| format!("GetClipboardData が失敗しました: {}", e))?;
-    let hglobal = windows::Win32::Foundation::HGLOBAL(handle.0);
-    let locked = unsafe { GlobalLock(hglobal) } as *const u16;
-    if locked.is_null() {
-        return Err("GlobalLock が null を返しました".to_string());
-    }
-    struct GlobalUnlockGuard(windows::Win32::Foundation::HGLOBAL);
-    impl Drop for GlobalUnlockGuard {
-        fn drop(&mut self) {
-            if let Err(e) = unsafe { GlobalUnlock(self.0) } {
-                tracing::debug!("GlobalUnlock が失敗しました: {}", e);
-            }
-        }
-    }
-    let _global_unlock_guard = GlobalUnlockGuard(hglobal);
-
-    let mut len = 0usize;
-    loop {
-        let ch = unsafe { *locked.add(len) };
-        if ch == 0 {
-            break;
-        }
-        len += 1;
-    }
-    let utf16 = unsafe { std::slice::from_raw_parts(locked, len) };
-    String::from_utf16(utf16).map_err(|e| format!("UTF-16 テキストのデコードに失敗しました: {}", e))
 }
 
 /// UI の録音開始用コマンド（`start:<buffer_frames>:<path>`）を生成する。
