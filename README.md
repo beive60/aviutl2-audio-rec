@@ -1,37 +1,46 @@
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-ワンボタンでマイク音声を録音しWAV ファイルとして保存し、AviUtl2（ExEdit2）のタイムラインを挿入する Rust 製プラグインと CLI クライアント。
+マイク音声をワンボタンで録音・WAV保存し、AviUtl2（AviUtl ExEdit2）のタイムラインへ自動挿入するプラグインです。
 
-AviUtl2 の汎用プラグイン（`.aux2`）が Named Pipe サーバーとして常駐し、CLI クライアントからの録音コマンドを受け取って Windows WASAPI 経由で録音セッションを制御します。Stream Input のプロファイルと組み合わせることで、コントローラーの1ボタン操作で録音の開始・停止ができます。録音停止後は収録した WAV ファイルがタイムラインのカーソル位置に自動挿入されます。
-
-## 背景
-
-AviUtl2（ExEdit2、KENくん氏による 64bit 対応版）でナレーションやスクラッチトラックを収録する際、NLE と外部の録音ソフトウェア（DAW）を行き来するオペレーションが必要です。本プロジェクトはこのコンテキストスイッチを排除し、AviUtl2 を操作したまま外部ハードウェアのボタン1つで録音を完結させることを目的としています。
-
-GUI の操作をエミュレートするのではなく、Named Pipe を通じて AviUtl2 プロセス内の録音処理を直接制御するため、ウィンドウのフォーカス状態や画面レイアウトに依存しない安定した自動化が実現できます。
-
-> **対象**: 旧 AviUtl（32bit）ではなく **AviUtl2（ExEdit2、64bit）** のみを対象とします。
-
-## インストール
-
-### 前提条件
+## 前提条件
 
 - Windows 10 または Windows 11（64bit）
 - AviUtl2（ExEdit2）がインストール済みであること
 
 > 動作確認は AviUtl2（ExEdit2）開発時点の最新版で行っています。AviUtl2 のバージョンアップ後に動作しない場合はリリースページで対応状況を確認してください。
 
-### リリースからインストール（推奨）
+## 概要
+
+AviUtl2 の汎用プラグインです。以下の方法で録音の開始・停止ができます。
+
+![demo](./images/demo.gif)
+
+- AviUtl2に録音パネルを追加して、録音開始・停止ボタンを押す
+- AviUtl2のショートカットキー設定からショートカットキーを設定する
+- CLIクライアントを利用する
+
+録音した音声は WAV ファイルで保存し、AviUtl2のタイムラインに挿入されます。
+
+> **対象**: 旧 AviUtl（32bit）ではなく **AviUtl2（ExEdit2、64bit）** のみを対象とします。
+
+## インストール
+
+### AviUtl2 カタログからインストール（推奨）
+
+[aviutl2-audio-rec | AviUtl2 Catalog Web](https://a2cw.sevenc7c.com/package/beive60.aviutl2-audio-rec)
+
+### リリースからインストール
 
 1. [GitHub Releases](https://github.com/beive60/aviutl2-audio-rec/releases/latest) から最新版の zip をダウンロードする。
 2. zip を展開する。
 3. `aviutl2_audio_rec.aux2` を `C:\ProgramData\AviUtl2\plugins\` にコピーする。
-4. `audio_rec_cli.exe` を任意の場所（例: `C:\ProgramData\AviUtl2\`）にコピーする。
-5. AviUtl2 を起動するとプラグインが自動的に読み込まれ、Named Pipe サーバーが起動します。
+4. `audio_rec_cli.exe` を任意の場所（例: `C:\ProgramData\AviUtl2\plugins\`）にコピーする。
 
 ### ソースからビルド
 
-ビルドには追加で以下が必要です。
+<details>
+
+<summary>ビルド方法はこちらから確認してください</summary>
 
 - [Rust toolchain](https://rustup.rs/) — `x86_64-pc-windows-msvc` ターゲット
 - [aviutl2-cli](https://github.com/sevenc-nanashi/aviutl2-cli) — ビルド・デプロイ・パッケージング用 CLI ツール（`au2` コマンド）
@@ -76,11 +85,77 @@ au2 release
 | `aviutl2_audio_rec.aux2` | AviUtl2 プラグイン本体 |
 | `audio_rec_cli.exe` | CLI クライアント |
 
+</details>
+
 ## 使い方
 
-### CLI
+### 初期設定
 
-AviUtl2 が起動した状態で実行します。出力先 WAV ファイルパスは省略可能です（後述のデフォルト保存先を参照）。
+※ 録音を行うには、あらかじめ保存先フォルダの設定が必要です。
+
+設定は AviUtl2 のヘッダーメニュー「設定 → プラグイン設定 → `[AudioRec] 設定...`」から行います。ダイアログで以下を変更できます。
+
+- 保存先（フォルダ選択ダイアログで指定）
+- バッファサイズ（既定値 / 1024 / 2048 / 4096 / 8192）
+
+<details>
+
+<summary>CLI クライアントから設定する方法</summary>
+
+デフォルト保存先の設定:
+
+```powershell
+audio_rec_cli.exe config save-path "C:\録音"
+```
+
+バッファサイズの設定:
+
+```powershell
+audio_rec_cli.exe config buffer-size 4096
+audio_rec_cli.exe config buffer-size 0 # デフォルト値に戻す
+```
+
+`config save-path` / `config buffer-size` サブコマンドで設定を保存します。設定は `%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` に JSON 形式で永続化され、CLI とプラグイン UI メニューで共通利用されます。
+
+</details>
+
+### AviUtl2 録音パネルでの操作
+
+AviUtl2 内のウィンドウクライアントとして `録音パネル` が追加されます。ヘッダーメニュー > 表示 > 録音パネルで表示してください。
+
+- 開始ボタン
+- 停止ボタン
+- 録音状態インジケータ（`● 録音中` / `○ 停止中`）
+
+録音パネルの開始/停止ボタンは、編集メニューの `録音開始` / `録音停止` と同じコマンド経路を利用します。
+
+### AviUtl2 ショートカット（メニュー）での操作
+
+AviUtl2 の編集メニュー > プラグインに以下が追加されます。
+
+- `AudioRec\録音開始`
+- `AudioRec\録音停止`
+
+これらのメニューはショートカットキーの設定からショートカットキーを割り当てることができます。
+
+- 編集: AudioRec\録音開始
+- 編集: AudioRec\録音停止
+
+`録音開始` は共有設定の保存先とバッファサイズを使用して録音を開始します。
+
+### Stream Deck 統合
+
+Stream Deck のプラグイン「Advanced Launcher [BarRaider]」を使用することを推奨します。
+
+※ デフォルト保存先を設定しておいてください。
+
+- Application に `audio_rec_cli.exe` のパスを指定してください（AviUtl2 カタログから導入した場合は `C:\ProgramData\AviUtl2\plugins\audio_rec_cli.exe`）
+- 録音開始は Arguments に `start`、録音停止は Arguments に `stop` を入力してください
+- LAUNCH SETTINGS の Background にチェックを入れてください
+
+### CLI での操作
+
+AviUtl2 が起動した状態で実行します。出力先 WAV ファイルパスは省略可能です（[初期設定](#初期設定)で設定したデフォルト保存先に保存されます）。
 
 録音を開始します。
 
@@ -95,67 +170,18 @@ audio_rec_cli.exe start # デフォルト保存先 + 自動ファイル名（yyy
 audio_rec_cli.exe stop
 ```
 
-#### デフォルト保存先の設定
-
-```sh
-audio_rec_cli.exe config save-path "C:\録音"
-```
-
-#### バッファサイズの設定
-
-```sh
-audio_rec_cli.exe config buffer-size 4096
-audio_rec_cli.exe config buffer-size 0 # デフォルト値に戻す
-```
-
-`config save-path` / `config buffer-size` サブコマンドで設定を保存します。設定は `%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` に JSON 形式で永続化され、CLI とプラグイン UI メニューで共通利用されます。
-
-#### AviUtl2 UI メニューでの操作
-
-AviUtl2 の編集メニュー > プラグインに以下が追加されます。
-
-- `AudioRec\録音開始`
-- `AudioRec\録音停止`
-
-設定は AviUtl2 のヘッダーメニュー「設定 → プラグイン設定 → `[AudioRec] 設定...`」から行います。ダイアログで以下を変更できます。
-
-- 保存先（フォルダ選択ダイアログで指定）
-- バッファサイズ（既定値 / 1024 / 2048 / 4096 / 8192）
-
-`録音開始` は共有設定の保存先とバッファサイズを使用して録音を開始します。
-保存先が未設定の場合はログにエラーを表示します。
-
 設定後は `start` にパスを渡さなくてもデフォルト保存先と自動生成ファイル名（例: `20260426-001234.wav`）が使用されます。デフォルトが未設定のままパスを省略すると明確なエラーが表示されます。
 
 成功すると終了コード 0 で終了します。エラー時は標準エラー出力にメッセージが表示され、非ゼロの終了コードで終了します。
 
-#### AviUtl2 録音パネルでの操作
+## 仕様・よくある質問
 
-AviUtl2 内のウィンドウクライアントとして `録音パネル` が追加され、以下を常時操作できます。
+- マイクはWindowsのデフォルト（既定）のマイクを使用します。スタート > 設定 > システム > サウンドから設定してください。
+- 挿入される音声オブジェクトはタイムラインのカーソル位置を起点に配置されます。カーソル位置にオブジェクトがある場合、同一のレイヤーの後ろ側に空いている位置に配置されます。
 
-- 開始ボタン
-- 停止ボタン
-- 録音状態インジケータ（`● 録音中` / `○ 停止中`）
+## 開発者向け情報
 
-録音パネルの開始/停止ボタンは、編集メニューの `録音開始` / `録音停止` と同じコマンド経路を利用します。
-録音パネルは AviUtl2 内に直接埋め込まれ、独立した別ウィンドウは作成しません。
-
-### Stream Deck 統合
-
-Stream Deck の「システム: コマンドの実行」アクションに以下のように設定します。
-
-```sh
-audio_rec_cli.exe start "C:\recordings\take1.wav"
-audio_rec_cli.exe stop
-```
-
-デフォルト保存先を設定済みであれば、パスを省略できます。
-
-```sh
-audio_rec_cli.exe start
-```
-
-## アーキテクチャ
+### アーキテクチャ
 
 ```txt
 [Stream Deck ボタンなど]
@@ -186,6 +212,12 @@ audio_rec_cli.exe start
 
 `config save-path` / `config buffer-size` サブコマンドはパイプを使用せず、`%PROGRAMDATA%\AviUtl2\audio_rec_cli.json` を直接更新します。
 
+### 実機回帰テスト
+
+個人開発向けの最小実機回帰セットと運用ルールは以下を参照してください。
+
+- [regression/README.md](regression/README.md)
+
 ## クレジット
 
 - [sevenc-nanashi/aviutl2-rs](https://github.com/sevenc-nanashi/aviutl2-rs) — AviUtl2 Plugin SDK の Rust バインディング。本プロジェクトのプラグイン実装はこの crate に依存しています。
@@ -196,12 +228,6 @@ audio_rec_cli.exe start
 Issue や Pull Request を歓迎します。[GitHub Issues](https://github.com/beive60/aviutl2-audio-rec/issues) で質問・提案を受け付けています。
 
 詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
-
-## 実機回帰テスト
-
-個人開発向けの最小実機回帰セットと運用ルールは以下を参照してください。
-
-- [regression/README.md](regression/README.md)
 
 ## ライセンス
 
