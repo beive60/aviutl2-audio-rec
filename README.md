@@ -5,7 +5,7 @@
 ## 前提条件
 
 - Windows 10 または Windows 11（64bit）
-- AviUtl2（ExEdit2）がインストール済みであること
+- [AviUtl2（ExEdit2）](https://spring-fragrance.mints.ne.jp/aviutl/)がインストール済みであること
 
 > 動作確認は AviUtl2（ExEdit2）開発時点の最新版で行っています。AviUtl2 のバージョンアップ後に動作しない場合はリリースページで対応状況を確認してください。
 
@@ -121,6 +121,8 @@ audio_rec_cli.exe config buffer-size 0 # デフォルト値に戻す
 
 ### AviUtl2 録音パネルでの操作
 
+![録音パネル](./images/gui-rec-pannel.png)
+
 AviUtl2 内のウィンドウクライアントとして `録音パネル` が追加されます。ヘッダーメニュー > 表示 > 録音パネルで表示してください。
 
 - 開始ボタン
@@ -145,7 +147,11 @@ AviUtl2 の編集メニュー > プラグインに以下が追加されます。
 
 ### Stream Deck 統合
 
-Stream Deck のプラグイン「Advanced Launcher [BarRaider]」を使用することを推奨します。
+![Stream Deckデモ](./images/streamdeck-demo.png)
+
+<sub>※ 画像は Elgato Stream Deck ソフトウェアの設定画面です</sub>
+
+連携の一例としてStream Deck のプラグイン「Advanced Launcher [BarRaider]」を使用する方法を紹介します。
 
 ※ デフォルト保存先を設定しておいてください。
 
@@ -178,6 +184,7 @@ audio_rec_cli.exe stop
 
 - マイクはWindowsのデフォルト（既定）のマイクを使用します。スタート > 設定 > システム > サウンドから設定してください。
 - 挿入される音声オブジェクトはタイムラインのカーソル位置を起点に配置されます。カーソル位置にオブジェクトがある場合、同一のレイヤーの後ろ側に空いている位置に配置されます。
+- 設定は `C:\ProgramData\aviutl2\audio_rec_cli.json` に保存されます。
 
 ## 開発者向け情報
 
@@ -232,3 +239,7 @@ Issue や Pull Request を歓迎します。[GitHub Issues](https://github.com/b
 ## ライセンス
 
 [MIT](LICENSE) © 2026 べいぶ
+
+---
+
+※ 本プロジェクトは個人開発による非公式プラグインであり、AviUtl2 開発元および各社とは無関係です。記載されている製品名・サービス名等は、各社または各開発者の商標・登録商標です。
