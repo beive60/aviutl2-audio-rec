@@ -3,7 +3,7 @@
 [project]
 id = "aviutl2-audio-rec"
 name = "aviutl2-audio-rec"
-version = "0.4.1"
+version = "0.4.2"
 
 [development]
 aviutl2_version = "latest"
