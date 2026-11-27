@@ -77,7 +77,7 @@ try {
 
     $distDir = Join-Path $repoRoot "dist"
     $stagingDir = Join-Path $distDir "release"
-    $packageRoot = Join-Path $stagingDir "Plugin\Beive60"
+    $packageRoot = Join-Path $stagingDir "Plugin"
     $zipFileName = "aviutl2-audio-rec-v$($Version).au2pkg.zip"
     $zipPath = Join-Path $distDir $zipFileName
 
@@ -85,11 +85,23 @@ try {
     if (Test-Path $stagingDir) { Remove-Item -Recurse -Force $stagingDir }
     New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 
-    # Copy files to the staging directory
-    Copy-Item -Path $exePath -Destination $stagingDir
+    # `au2 release` と同一の構造にする:
+    #   package.ini
+    #   Plugin/aviutl2_audio_rec.aux2
+    #   Plugin/aviutl2-audio-rec/audio_rec_cli.exe
+    $cliDir = Join-Path $packageRoot "aviutl2-audio-rec"
+    New-Item -ItemType Directory -Path $cliDir -Force | Out-Null
+    Copy-Item -Path $exePath -Destination (Join-Path $cliDir "audio_rec_cli.exe")
     Copy-Item -Path $dllPath -Destination (Join-Path $packageRoot "aviutl2_audio_rec.aux2")
-    Copy-Item -Path (Join-Path $repoRoot "README.md") -Destination $stagingDir
-    Copy-Item -Path (Join-Path $repoRoot "LICENSE") -Destination $stagingDir
+
+    $packageIni = @(
+        "[package]"
+        "id=aviutl2-audio-rec"
+        "name=aviutl2-audio-rec"
+        "information=aviutl2-audio-rec v$Version"
+        "uninstallSubFolderFile=0"
+    ) -join "`n"
+    [System.IO.File]::WriteAllText((Join-Path $stagingDir "package.ini"), $packageIni + "`n", (New-Object System.Text.UTF8Encoding($false)))
 
     # Create the archive from the staging directory's contents
     Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipPath -Force
